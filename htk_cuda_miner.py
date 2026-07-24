@@ -10,12 +10,12 @@ What it does
   the exact HTK contract rule that ../listener.py re-verifies before minting.
 - One OS process per GPU (no GIL contention; a CUDA fault on one GPU can't take
   the others down — the worker is auto-restarted).
-- Provably NON-OVERLAPPING nonce ranges across every GPU on every rig: each GPU
-  is a global worker `W` of `N` total, and uses base_nonce_part = W + k*N for
-  k = 0,1,2,...  Because base_nonce_part occupies nonce bytes 0-7 and thread_id
-  occupies bytes 8-15 (disjoint byte ranges), distinct base_nonce_part values
-  always yield disjoint nonce sets — so a strided partition of base_nonce_part
-  tiles the whole space with zero overlap and zero gaps.
+- NON-OVERLAPPING nonce ranges with ZERO coordination: each rig picks a random
+  64-bit start base at launch; its GPU g mines base_nonce_part = start + g + k*G
+  (G = the rig's GPU count) for k = 0,1,2,...  Because base_nonce_part occupies
+  nonce bytes 0-7 and thread_id bytes 8-15 (disjoint), a rig's own GPUs never
+  collide; the random start makes two rigs colliding ~10^-12. So every rig runs
+  the IDENTICAL command — no --rig-id, no offsets to manage.
 - Per-GPU auto-tuning: sweeps block sizes, then GROWS the grid until each launch
   lasts ~--target-launch-seconds. Long GPU launches keep the CUDA cores busy and
   the host nearly idle (few round-trips/sec), as requested.
@@ -26,13 +26,15 @@ What it does
 - Startup banner + error/warning alerts go to a SEPARATE ntfy STATUS topic so the
   nonce channel stays clean. No heartbeat (hashrate is logged to stdout only).
 
-See README.md for vast.ai setup and the multi-rig launch formula.
+Supports 40-series (sm_89) and 50-series (sm_120) alike — the kernel is compiled
+for each card's detected compute capability. See README.md for vast.ai setup.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import multiprocessing as mp
 import os
 import queue
@@ -79,14 +81,24 @@ def _compile_kernel(cu_source: str):
     Primary path: backend='nvcc' (real compiler, handles <cuda_runtime.h>).
     Fallback: backend='nvrtc' with the cuda_runtime.h include stripped in-memory
     (the on-disk .cu is never modified; hashing logic is untouched).
+
+    Targets the CURRENT device's compute capability explicitly (e.g. sm_120 for
+    RTX 5090 / Blackwell) so we get native SASS instead of PTX-JIT from an old
+    default. Requires the toolkit to know that arch (CUDA 12.8+ for sm_120).
     """
     import cupy as cp
+
+    try:
+        cc = cp.cuda.Device().compute_capability   # e.g. '120', '89', '86'
+        arch_opt = (f"-arch=sm_{cc}",)
+    except Exception:
+        arch_opt = ()
 
     try:
         mod = cp.RawModule(
             code=cu_source,
             backend="nvcc",
-            options=("-O3", "-std=c++14"),
+            options=("-O3", "-std=c++14") + arch_opt,
             name_expressions=[KERNEL_NAME],
         )
         return mod.get_function(KERNEL_NAME)
@@ -162,6 +174,7 @@ def gpu_worker(gpu_id, worker_id, num_workers, cu_source, args,
         dev = cp.cuda.Device(gpu_id)
         dev.use()
         name = cp.cuda.runtime.getDeviceProperties(gpu_id)["name"].decode()
+        cc = dev.compute_capability   # '89' = 40-series, '120' = 50-series, etc.
 
         kern = _compile_kernel(cu_source)
 
@@ -194,10 +207,11 @@ def gpu_worker(gpu_id, worker_id, num_workers, cu_source, args,
                 pass
 
         out_q.put({
-            "type": "ready", "worker": worker_id, "gpu": gpu_id, "name": name,
+            "type": "ready", "worker": worker_id, "gpu": gpu_id,
+            "name": f"{name} (sm_{cc})",
             "block": block, "grid": grid, "hashrate": hashrate,
         })
-        log(f"[{tag}] {name}: block={block} grid={grid} "
+        log(f"[{tag}] {name} sm_{cc}: block={block} grid={grid} "
             f"~{hashrate/1e6:.1f} MH/s per-launch~{block*grid/max(hashrate,1):.2f}s")
 
         k = 0                 # private strided launch counter (never reset)
@@ -379,6 +393,9 @@ def run_miner(args, cu_source):
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
+    # Short per-rig label (from the random start base) so alerts on the shared
+    # status topic are attributable and correlate to that rig's banner.
+    rig_tag = f"{args.worker_offset:016x}"[:8]
     ready = {}                    # worker_id -> ready info
     banner_sent = False
     seen_nonces = set()
@@ -387,7 +404,7 @@ def run_miner(args, cu_source):
     last_rate_print = time.time()
 
     def send_banner():
-        lines = [f"HTK miner UP — rig {args.rig_id}, {len(args.gpus)} GPU(s)"]
+        lines = [f"HTK miner UP — rig {rig_tag}, {len(args.gpus)} GPU(s)"]
         total = 0.0
         for wid in sorted(ready):
             r = ready[wid]
@@ -395,11 +412,11 @@ def run_miner(args, cu_source):
             lines.append(f"  gpu{r['gpu']} {r['name']}: "
                          f"{r['hashrate']/1e6:.0f} MH/s (block {r['block']}, grid {r['grid']})")
         lines.append(f"  total ~{total/1e6:.0f} MH/s")
-        lines.append(f"  workers W={args.worker_offset}..{args.worker_offset+len(args.gpus)-1} of N={args.num_workers}")
+        lines.append(f"  random start base=0x{args.worker_offset:016x} stride={args.num_workers}")
         body = "\n".join(lines)
         log(body)
         ntfy_push(args.ntfy_base, args.status_topic, body,
-                  title=f"HTK rig {args.rig_id} up", tags="rocket")
+                  title=f"HTK rig {rig_tag} up", tags="rocket")
 
     try:
         while not stop_evt.is_set():
@@ -409,8 +426,8 @@ def run_miner(args, cu_source):
                     p.join(timeout=1)  # reap the exited process
                     log(f"[gpu{gpu_id}/W{wid}] worker died — restarting")
                     ntfy_push(args.ntfy_base, args.status_topic,
-                              f"rig {args.rig_id} gpu{gpu_id} worker restarted",
-                              title=f"HTK rig {args.rig_id} warning", tags="warning")
+                              f"rig {rig_tag} gpu{gpu_id} worker restarted",
+                              title=f"HTK rig {rig_tag} warning", tags="warning")
                     procs[wid] = (gpu_id, spawn_worker(
                         ctx, gpu_id, wid, args, cu_source,
                         job_buf, job_gen, job_lock, out_q, stop_evt))
@@ -446,8 +463,8 @@ def run_miner(args, cu_source):
                         else:
                             log("  ntfy push FAILED (saved locally; will not retry)")
                             ntfy_push(args.ntfy_base, args.status_topic,
-                                      f"rig {args.rig_id}: ntfy nonce push failed (nonce saved locally)",
-                                      title=f"HTK rig {args.rig_id} warning", tags="warning")
+                                      f"rig {rig_tag}: ntfy nonce push failed (nonce saved locally)",
+                                      title=f"HTK rig {rig_tag} warning", tags="warning")
                 elif t == "stat":
                     mhs = msg["hashes"] / max(msg["dt"], 1e-9) / 1e6
                     rate_by_gpu[msg["gpu"]] = mhs
@@ -614,19 +631,9 @@ def build_args():
         description="Multi-GPU HTK CUDA miner for vast.ai",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # fleet / partitioning
-    p.add_argument("--rig-id", type=int, default=0,
-                   help="this rig's index (0-based) among all rigs")
-    p.add_argument("--total-rigs", type=int, default=1,
-                   help="number of independent rigs in the fleet")
+    # gpus
     p.add_argument("--gpus", default="all",
                    help="'all' or comma list of GPU ids, e.g. 0,1,2,3")
-    p.add_argument("--gpus-per-rig", type=int, default=0,
-                   help="override GPUs/rig for the partition (0 = use this rig's count)")
-    p.add_argument("--global-workers", type=int, default=0,
-                   help="override total global workers N (0 = total_rigs*gpus_per_rig)")
-    p.add_argument("--worker-offset", type=int, default=-1,
-                   help="override this rig's first global worker id (default rig_id*gpus_per_rig)")
     # tuning
     p.add_argument("--target-launch-seconds", type=float, default=2.0,
                    help="grow grid until each kernel launch lasts ~this long")
@@ -659,14 +666,12 @@ def build_args():
         sys.exit("No CUDA GPUs detected (or --gpus empty).")
     args.block_sizes = [int(x) for x in args.block_sizes.split(",") if x.strip()]
 
-    gpr = args.gpus_per_rig or len(args.gpus)
-    args.num_workers = args.global_workers or (args.total_rigs * gpr)
-    if args.worker_offset < 0:
-        args.worker_offset = args.rig_id * gpr
-    if args.num_workers < args.worker_offset + len(args.gpus):
-        sys.exit(f"Bad partition: N={args.num_workers} but this rig needs ids "
-                 f"{args.worker_offset}..{args.worker_offset+len(args.gpus)-1}. "
-                 f"Increase --total-rigs/--global-workers or fix --rig-id.")
+    # Nonce partition: each GPU mines base_nonce_part = start + local_gpu + k*G
+    # (G = this rig's GPU count). The rig picks a RANDOM 64-bit `start` at launch,
+    # so its own GPUs never collide and two rigs colliding is ~10^-12 — every rig
+    # runs the IDENTICAL command with no coordination.
+    args.num_workers = len(args.gpus)          # stride G (keeps this rig's GPUs apart)
+    args.worker_offset = secrets.randbits(64)  # random per-rig start base
     return args
 
 
@@ -676,8 +681,9 @@ def main():
         sys.exit(f"kernel source not found: {CU_PATH}")
     cu_source = CU_PATH.read_text()
 
-    log(f"HTK CUDA miner — rig {args.rig_id}/{args.total_rigs}, GPUs {args.gpus}, "
-        f"global workers {args.worker_offset}..{args.worker_offset+len(args.gpus)-1} of {args.num_workers}")
+    log(f"HTK CUDA miner — GPUs {args.gpus}, random start "
+        f"base=0x{args.worker_offset:016x} stride={args.num_workers} "
+        f"(identical command is safe across rigs)")
 
     if args.self_test:
         sys.exit(self_test(args, cu_source))
