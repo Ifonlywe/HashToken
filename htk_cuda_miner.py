@@ -8,8 +8,10 @@ import os
 import queue
 import secrets
 import signal
+import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -35,6 +37,7 @@ STATUS_TOPIC = "htk-status-35cb5d56831536e9924deb7b"
 TARGET_LAUNCH_SECONDS = 2.0
 BLOCK_SIZES = [128, 256, 512, 1024]
 POLL_INTERVAL = 12.0
+MAX_RESTARTS = 5          # per GPU, before declaring it dead instead of spinning
 FOUND_LOG = SCRIPT_DIR / "found_nonces.jsonl"
 TUNE_CACHE = SCRIPT_DIR / ".tune_cache.json"
 
@@ -88,11 +91,22 @@ def _autotune(cp, kern, dev, d_prev, d_nonce, d_flag):
     max_grid = int(dev.attributes.get("MaxGridDimX", 2**31 - 1))
     calib = sm * 64
     best = None
+    errs = []
     for block in BLOCK_SIZES:
-        _benchmark(cp, kern, d_prev, d_zero, d_nonce, d_flag, block, calib)
-        hr = _benchmark(cp, kern, d_prev, d_zero, d_nonce, d_flag, block, calib)
+        try:
+            _benchmark(cp, kern, d_prev, d_zero, d_nonce, d_flag, block, calib)
+            hr = _benchmark(cp, kern, d_prev, d_zero, d_nonce, d_flag, block, calib)
+        except Exception as e:
+            # e.g. "too many resources requested for launch" on the larger blocks.
+            # Skip the size rather than killing the whole worker.
+            errs.append(f"block={block}: {type(e).__name__}: {e}")
+            log(f"  autotune: block={block} UNUSABLE ({type(e).__name__}: {e})")
+            continue
+        log(f"  autotune: block={block} -> {hr/1e6:.0f} MH/s")
         if best is None or hr > best[0]:
             best = (hr, block)
+    if best is None:
+        raise RuntimeError("no usable block size — " + "; ".join(errs))
     hashrate, block = best
     grid = max(calib, int(hashrate * TARGET_LAUNCH_SECONDS) // block)
     grid = max(1, min(grid, max_grid))
@@ -101,21 +115,32 @@ def _autotune(cp, kern, dev, d_prev, d_nonce, d_flag):
 
 def gpu_worker(gpu_id, worker_id, num_workers, cu_source, job_buf, job_gen, job_lock, out_q, stop_evt):
     tag = f"gpu{gpu_id}"
+    # Names the phase we are in, so a crash says WHERE and not just WHAT.
+    step = "startup"
     try:
+        step = "import cupy"
         import cupy as cp
         import numpy as np
 
+        step = f"select device {gpu_id}"
         dev = cp.cuda.Device(gpu_id)
         dev.use()
-        name = cp.cuda.runtime.getDeviceProperties(gpu_id)["name"].decode()
-        cc = dev.compute_capability
 
+        step = "read device properties"
+        raw_name = cp.cuda.runtime.getDeviceProperties(gpu_id)["name"]
+        name = raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name)
+        cc = dev.compute_capability
+        log(f"[{tag}] device: {name} sm_{cc}")
+
+        step = "compile kernel"
         kern = _compile_kernel(cu_source)
+        step = "allocate device buffers"
         d_prev = cp.zeros(32, dtype=cp.uint8)
         d_target = cp.full(32, 255, dtype=cp.uint8)
         d_nonce = cp.zeros(32, dtype=cp.uint8)
         d_flag = cp.zeros(1, dtype=cp.int32)
 
+        step = "read tune cache"
         cache = {}
         if TUNE_CACHE.exists():
             try:
@@ -126,6 +151,8 @@ def gpu_worker(gpu_id, worker_id, num_workers, cu_source, job_buf, job_gen, job_
         if ck in cache:
             block, grid, hashrate = cache[ck]["block"], cache[ck]["grid"], cache[ck].get("hashrate", 0.0)
         else:
+            step = "autotune"
+            log(f"[{tag}] autotuning (block sizes {BLOCK_SIZES})…")
             block, grid, hashrate = _autotune(cp, kern, dev, d_prev, d_nonce, d_flag)
             cache[ck] = {"block": block, "grid": grid, "hashrate": hashrate}
             try:
@@ -137,6 +164,7 @@ def gpu_worker(gpu_id, worker_id, num_workers, cu_source, job_buf, job_gen, job_
                    "block": block, "grid": grid, "hashrate": hashrate})
         log(f"[{tag}] {name} sm_{cc}: block={block} grid={grid} ~{hashrate/1e6:.1f} MH/s")
 
+        step = "mining loop"
         k = 0
         cur_gen = -1
         prev = b"\x00" * 32
@@ -175,8 +203,20 @@ def gpu_worker(gpu_id, worker_id, num_workers, cu_source, job_buf, job_gen, job_
                 hashes = 0
                 t0 = time.time()
     except Exception as e:
+        # Print first: stdout is inherited from the coordinator, so this reaches
+        # the vast console / onstart.log even if the queue hand-off fails.
+        print(f"\n===== [{tag}] WORKER CRASHED during: {step} =====", flush=True)
+        traceback.print_exc()
+        print(f"===== [{tag}] end traceback =====\n", flush=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
         try:
-            out_q.put({"type": "error", "gpu": gpu_id, "msg": f"{type(e).__name__}: {e}"})
+            out_q.put({"type": "error", "gpu": gpu_id, "msg": f"[{step}] {type(e).__name__}: {e}"})
+            # put() only hands off to a feeder thread; os._exit would kill it
+            # mid-flush and lose the message — which is why crashes used to be
+            # invisible. Wait for the pipe write to actually complete.
+            out_q.close()
+            out_q.join_thread()
         except Exception:
             pass
         os._exit(1)
@@ -305,6 +345,8 @@ def run_miner(args, cu_source):
     banner_sent = False
     seen = set()
     rate = {}
+    fails = {g: 0 for g in gpus}     # consecutive crashes per GPU
+    last_err = {}                    # last error text reported by each GPU
     found_log = open(FOUND_LOG, "a", buffering=1)
     last_print = time.time()
 
@@ -321,24 +363,24 @@ def run_miner(args, cu_source):
 
     try:
         while not stop_evt.is_set():
-            for gpu_id, p in list(procs.items()):
-                if not p.is_alive() and not stop_evt.is_set():
-                    p.join(timeout=1)
-                    log(f"[gpu{gpu_id}] worker died — restarting")
-                    ntfy_push(args.status_topic, f"rig {rig_tag} gpu{gpu_id} restarted",
-                              title=f"HTK rig {rig_tag} warning", tags="warning")
-                    wid = secrets.randbits(64)
-                    procs[gpu_id] = spawn_worker(ctx, gpu_id, wid, num_workers, cu_source,
-                                                 job_buf, job_gen, job_lock, out_q, stop_evt)
+            # Drain every queued message BEFORE reacting to a death, so a
+            # worker's dying error is on record when we report the crash.
+            msgs = []
             try:
-                msg = out_q.get(timeout=1.0)
+                msgs.append(out_q.get(timeout=1.0))
             except queue.Empty:
-                msg = None
+                pass
+            while True:
+                try:
+                    msgs.append(out_q.get_nowait())
+                except queue.Empty:
+                    break
 
-            if msg:
+            for msg in msgs:
                 t = msg["type"]
                 if t == "ready":
                     ready[msg["gpu"]] = msg
+                    fails[msg["gpu"]] = 0          # reached steady state, reset
                     if not banner_sent and len(ready) >= len(gpus):
                         send_banner()
                         banner_sent = True
@@ -361,7 +403,39 @@ def run_miner(args, cu_source):
                 elif t == "stat":
                     rate[msg["gpu"]] = msg["hashes"] / max(msg["dt"], 1e-9) / 1e6
                 elif t == "error":
+                    last_err[msg["gpu"]] = msg["msg"]
                     log(f"[gpu{msg['gpu']}] ERROR: {msg['msg']}")
+
+            for gpu_id, p in list(procs.items()):
+                if p.is_alive() or stop_evt.is_set():
+                    continue
+                p.join(timeout=1)
+                fails[gpu_id] += 1
+                n = fails[gpu_id]
+                err = last_err.get(gpu_id, "no error captured — see the worker traceback above")
+
+                if n > MAX_RESTARTS:
+                    log(f"[gpu{gpu_id}] GIVING UP after {MAX_RESTARTS} restarts — {err}")
+                    ntfy_push(args.status_topic,
+                              f"rig {rig_tag} gpu{gpu_id} DEAD after {MAX_RESTARTS} restarts\n{err}",
+                              title=f"HTK rig {rig_tag} gpu{gpu_id} dead", tags="rotating_light")
+                    procs.pop(gpu_id, None)
+                    if not procs:
+                        log("all GPU workers dead — exiting so the rig stops burning time")
+                        stop_evt.set()
+                    continue
+
+                delay = min(2 ** n, 60)
+                log(f"[gpu{gpu_id}] worker died ({n}/{MAX_RESTARTS}) — retry in {delay}s — {err}")
+                if n == 1:      # alert once, not on every retry
+                    ntfy_push(args.status_topic, f"rig {rig_tag} gpu{gpu_id} crashed: {err}",
+                              title=f"HTK rig {rig_tag} warning", tags="warning")
+                stop_evt.wait(delay)
+                if stop_evt.is_set():
+                    break
+                wid = secrets.randbits(64)
+                procs[gpu_id] = spawn_worker(ctx, gpu_id, wid, num_workers, cu_source,
+                                             job_buf, job_gen, job_lock, out_q, stop_evt)
 
             if time.time() - last_print >= 10.0 and rate:
                 total = sum(rate.values())
@@ -459,9 +533,26 @@ def self_test(cu_source):
         if hits >= 25:
             break
 
+    # Exercise the worker's SETUP path too. The hash check above runs a fixed
+    # block=256/grid=4096 launch in this process and never touches device
+    # properties or the autotune sweep — which is exactly where workers die.
+    tune_ok = True
+    try:
+        dev = cp.cuda.Device(0)
+        raw_name = cp.cuda.runtime.getDeviceProperties(0)["name"]
+        dev_name = raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name)
+        log(f"self-test device: {dev_name} sm_{dev.compute_capability}")
+        b, g, hr = _autotune(cp, kern, dev, d_prev, d_nonce, d_flag)
+        log(f"self-test autotune: block={b} grid={g} ~{hr/1e6:.0f} MH/s")
+    except Exception as e:
+        tune_ok = False
+        log(f"self-test autotune FAILED: {type(e).__name__}: {e}")
+        traceback.print_exc()
+
     disjoint = {i * 2 for i in range(1000)}.isdisjoint({1 + i * 2 for i in range(1000)})
-    log(f"self-test: {hits} GPU hits CPU-verified, {fails} mismatches; disjoint={disjoint}")
-    if fails == 0 and hits > 0 and disjoint:
+    log(f"self-test: {hits} GPU hits CPU-verified, {fails} mismatches; "
+        f"autotune={'ok' if tune_ok else 'FAILED'}; disjoint={disjoint}")
+    if fails == 0 and hits > 0 and disjoint and tune_ok:
         log("SELF-TEST PASSED ✓")
         return 0
     log("SELF-TEST FAILED ✗")
