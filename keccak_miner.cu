@@ -57,14 +57,14 @@ __device__ void keccak256_solidity(unsigned char* out, const unsigned char* in_m
     }
 }
 
-__global__ void find_solution_kernel(const unsigned char* d_prev_hash,
+extern "C" __global__ void find_solution_kernel(const unsigned char* d_prev_hash,
                                     const unsigned char* d_max_value_target,
                                     unsigned char* d_solution_nonce,
                                     unsigned long long base_nonce_part,
                                     int* d_solution_found_flag) {
-    
-    unsigned long long thread_id = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; 
-    
+
+    unsigned long long thread_id = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+
     // Use shared memory for prev_hash to improve performance
     __shared__ unsigned char shared_prev_hash[32];
     if (threadIdx.x < 32) {
@@ -73,48 +73,48 @@ __global__ void find_solution_kernel(const unsigned char* d_prev_hash,
     __syncthreads();
 
     // Prepare nonce and message
-    unsigned char message[64]; 
-    unsigned char current_nonce[32] = {0}; 
-    
+    unsigned char message[64];
+    unsigned char current_nonce[32] = {0};
+
     // Set nonce: base_nonce_part + thread_id
     // This assumes base_nonce_part fills the first 8 bytes (uint64)
     // and thread_id fills the next 8 bytes (uint64)
     // The remaining 16 bytes of the 32-byte nonce are zero.
-    *(unsigned long long*)(&current_nonce[0]) = base_nonce_part; 
+    *(unsigned long long*)(&current_nonce[0]) = base_nonce_part;
     *(unsigned long long*)(&current_nonce[8]) = thread_id;
 
     // Build message: nonce (32 bytes) + prev_hash (32 bytes)
-    for (int i = 0; i < 32; ++i) { 
-        message[i] = current_nonce[i]; 
-    } 
-    for (int i = 0; i < 32; ++i) { 
-        message[32 + i] = shared_prev_hash[i]; 
-    } 
-    
+    for (int i = 0; i < 32; ++i) {
+        message[i] = current_nonce[i];
+    }
+    for (int i = 0; i < 32; ++i) {
+        message[32 + i] = shared_prev_hash[i];
+    }
+
     // Compute hash
-    unsigned char hash_result[32]; 
-    keccak256_solidity(hash_result, message); 
-    
+    unsigned char hash_result[32];
+    keccak256_solidity(hash_result, message);
+
     // Check if hash <= target (big-endian comparison)
-    bool is_less_or_equal = true; 
-    for (int k = 0; k < 32; ++k) { 
-        if (hash_result[k] > d_max_value_target[k]) { 
-            is_less_or_equal = false; 
-            break; 
-        } 
-        if (hash_result[k] < d_max_value_target[k]) { 
-            is_less_or_equal = true; 
-            break; 
-        } 
-    } 
-    
+    bool is_less_or_equal = true;
+    for (int k = 0; k < 32; ++k) {
+        if (hash_result[k] > d_max_value_target[k]) {
+            is_less_or_equal = false;
+            break;
+        }
+        if (hash_result[k] < d_max_value_target[k]) {
+            is_less_or_equal = true;
+            break;
+        }
+    }
+
     // If solution found, store it atomically
-    if (is_less_or_equal) { 
+    if (is_less_or_equal) {
         // Atomic compare-and-swap: if flag is 0, set to 1 and return old value (0)
-        if (atomicCAS(d_solution_found_flag, 0, 1) == 0) { 
-            for (int k = 0; k < 32; ++k) { 
-                d_solution_nonce[k] = current_nonce[k]; 
-            } 
-        } 
-    } 
+        if (atomicCAS(d_solution_found_flag, 0, 1) == 0) {
+            for (int k = 0; k < 32; ++k) {
+                d_solution_nonce[k] = current_nonce[k];
+            }
+        }
+    }
 }

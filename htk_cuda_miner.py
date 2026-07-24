@@ -50,16 +50,21 @@ def _compile_kernel(cu_source):
         arch = (f"-arch=sm_{cc}",)
     except Exception:
         arch = ()
+    # The kernel is extern "C", so its symbol is unmangled and name_expressions
+    # is unnecessary — passing it would make the nvcc backend reject the module.
     try:
         mod = cp.RawModule(code=cu_source, backend="nvcc",
-                           options=("-O3", "-std=c++14") + arch,
-                           name_expressions=[KERNEL_NAME])
+                           options=("-O3", "-std=c++14") + arch)
         return mod.get_function(KERNEL_NAME)
     except Exception as e_nvcc:
-        stripped = "\n".join(l for l in cu_source.splitlines() if "cuda_runtime.h" not in l)
+        # NVRTC has no filesystem headers at all: drop every #include and spell
+        # out the one stdint type the kernel uses.
+        stripped = "\n".join(l for l in cu_source.splitlines()
+                             if not l.lstrip().startswith("#include"))
+        stripped = stripped.replace("uint64_t", "unsigned long long")
         try:
             mod = cp.RawModule(code=stripped, backend="nvrtc",
-                               options=("-std=c++14",), name_expressions=[KERNEL_NAME])
+                               options=("-std=c++14",))
             return mod.get_function(KERNEL_NAME)
         except Exception as e_nvrtc:
             raise RuntimeError(f"compile failed (nvcc: {e_nvcc}; nvrtc: {e_nvrtc})")
