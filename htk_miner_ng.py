@@ -415,11 +415,11 @@ def run_miner(args, cu_source):
               if getattr(args, "nonce_region", None) is not None
               else region_for(rig_tag))
     share_tgt = share_target_hi(share_bits)
-    # More GPUs means proportionally more shares; raise the difficulty so the
-    # per-rig message size stays constant regardless of rig width.
-    if num_workers > 1:
-        share_bits += max(0, (num_workers - 1).bit_length())
-        share_tgt = share_target_hi(share_bits)
+    # NOTE: share_bits is assigned by the controller (HTK_SHARE_BITS) and is NOT
+    # adjusted here. A rig that picked its own difficulty would break the
+    # controller's hashrate estimate -- and the controller cannot simply trust a
+    # rig-reported value, since inflating it would inflate reported work. The
+    # controller already scales for GPU count when it assigns.
     try:
         dph = float(os.environ.get("HTK_DPH") or 0)
     except ValueError:
