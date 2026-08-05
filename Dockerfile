@@ -24,11 +24,10 @@
 # ship without a rebuild.
 FROM python:3.12-slim
 
-# ca-certificates for HTTPS. curl is NOT required: the boot script uses python's
-# urllib, which is already here, so we skip ~10 MB of apt.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+# No apt at all. python:3.12-slim already ships ca-certificates (pip could not
+# do HTTPS otherwise), and the boot script uses urllib rather than curl -- so
+# there is nothing to install. That removes an apt round-trip from the build and
+# a layer from the image.
 
 # Pinned so the tag is reproducible and host caches stay valid.
 # cuda-toolkit is installed with ONLY cudart and nvrtc -- cublas, cufft, curand,
