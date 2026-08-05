@@ -477,14 +477,11 @@ def run_miner(args, cu_source):
         with job_lock:
             mv = int.from_bytes(bytes(job_buf[32:64]), "big")
         cost = ""
-        if mv and total > 0:
-            hashes = (1 << 256) // (mv + 1)
+        if mv and total > 0 and dph > 0:
+            hashes = (1 << 256) // (mv + 1)      # expected hashes per coin
             hours = hashes / total / 3600.0
-            line = f"{hours:,.0f}h/coin @ {hashes/1e12:,.0f} TH"
-            if dph > 0:
-                line += f" -> ${hours * dph:,.2f}/HTK"
-            cost = line
-        elif total > 0:
+            cost = f"${hours * dph:,.2f}/HTK"
+        elif total > 0 and not mv:
             cost = "awaiting chain difficulty"
 
         body = (f"{name} x{len(gpus)} | {total/1e9:.2f} GH/s"
