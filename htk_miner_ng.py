@@ -93,11 +93,13 @@ def _compile_kernel(cu_source):
                              if not l.lstrip().startswith("#include"))
         stripped = stripped.replace("uint64_t", "unsigned long long")
         try:
-            # -O3 to match the nvcc path exactly. Phase -1 measured the two
-            # backends within 0.03% on a 5090; keep the flags identical so that
-            # stays true and any future divergence is a real signal.
+            # NVRTC only, and deliberately WITHOUT -O3: that is an nvcc-only
+            # flag and NVRTC rejects it with NVRTC_ERROR_INVALID_OPTION (5),
+            # which breaks every rig on an image without nvcc. NVRTC already
+            # optimises by default, and Phase -1 measured this path within
+            # 0.03% of nvcc on a 5090 using exactly these options.
             mod = cp.RawModule(code=stripped, backend="nvrtc",
-                               options=("-O3", "-std=c++14"))
+                               options=("-std=c++14",))
             return mod.get_function(KERNEL_NAME)
         except Exception as e_nvrtc:
             raise RuntimeError(f"compile failed (nvcc: {e_nvcc}; nvrtc: {e_nvrtc})")
