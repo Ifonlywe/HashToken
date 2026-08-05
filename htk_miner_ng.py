@@ -722,33 +722,6 @@ def self_test(cu_source):
     return 1
 
 
-def main():
-    p = argparse.ArgumentParser(description="Multi-GPU HTK CUDA miner")
-    p.add_argument("--status-topic", default=STATUS_TOPIC)
-    p.add_argument("--rig-id", default=None,
-                   help="stable identity; defaults to $VAST_CONTAINERLABEL")
-    p.add_argument("--share-topic", default=SHARE_TOPIC)
-    p.add_argument("--share-bits", type=int, default=DEFAULT_SHARE_BITS)
-    p.add_argument("--heartbeat-secs", type=float, default=DEFAULT_HEARTBEAT)
-    p.add_argument("--nonce-region", type=int, default=None,
-                   help="override the derived region (testing only)")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--self-test", action="store_true")
-    args = p.parse_args()
-
-    if not CU_PATH.exists():
-        raise SystemExit(f"kernel source not found: {CU_PATH}")
-    cu_source = CU_PATH.read_text()
-
-    if args.self_test:
-        raise SystemExit(self_test(cu_source))
-    run_miner(args, cu_source)
-
-
-if __name__ == "__main__":
-    main()
-
-
 # ===========================================================================
 # NEXT-GEN: share batching and heartbeat reporting
 # ===========================================================================
@@ -817,3 +790,30 @@ class ShareReporter:
         self.seen_total = 0
         self.last = now or time.time()
         return ok, msg
+
+
+def main():
+    p = argparse.ArgumentParser(description="Multi-GPU HTK CUDA miner")
+    p.add_argument("--status-topic", default=STATUS_TOPIC)
+    p.add_argument("--rig-id", default=None,
+                   help="stable identity; defaults to $VAST_CONTAINERLABEL")
+    p.add_argument("--share-topic", default=SHARE_TOPIC)
+    p.add_argument("--share-bits", type=int, default=DEFAULT_SHARE_BITS)
+    p.add_argument("--heartbeat-secs", type=float, default=DEFAULT_HEARTBEAT)
+    p.add_argument("--nonce-region", type=int, default=None,
+                   help="override the derived region (testing only)")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--self-test", action="store_true")
+    args = p.parse_args()
+
+    if not CU_PATH.exists():
+        raise SystemExit(f"kernel source not found: {CU_PATH}")
+    cu_source = CU_PATH.read_text()
+
+    if args.self_test:
+        raise SystemExit(self_test(cu_source))
+    run_miner(args, cu_source)
+
+
+if __name__ == "__main__":
+    main()
