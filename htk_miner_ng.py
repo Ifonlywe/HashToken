@@ -420,7 +420,12 @@ def run_miner(args, cu_source):
     if num_workers > 1:
         share_bits += max(0, (num_workers - 1).bit_length())
         share_tgt = share_target_hi(share_bits)
-    log(f"rig={rig_tag} region={region:#08x} share_bits={share_bits}")
+    try:
+        dph = float(os.environ.get("HTK_DPH") or 0)
+    except ValueError:
+        dph = 0.0
+    log(f"rig={rig_tag} region={region:#08x} share_bits={share_bits} "
+        f"dph=${dph:.4f}/hr")
     log(f"HTK CUDA miner — GPUs {gpus}, random start base=0x{start_base:016x} stride={num_workers}")
 
     ctx = mp.get_context("spawn")
@@ -460,15 +465,33 @@ def run_miner(args, cu_source):
                              gpus={})
 
     def send_banner():
+        """Compact status: what this box is, what it costs, and -- the number
+        that actually decides whether to keep it -- what one HTK would cost if
+        this machine mined it alone at the current on-chain difficulty."""
         total = sum(r["hashrate"] for r in ready.values())
-        lines = [f"HTK miner UP — rig {rig_tag}, {len(gpus)} GPU(s)"]
-        for g in sorted(ready):
-            r = ready[g]
-            lines.append(f"  gpu{g} {r['name']}: {r['hashrate']/1e6:.0f} MH/s")
-        lines.append(f"  total ~{total/1e6:.0f} MH/s")
-        body = "\n".join(lines)
-        log(body)
-        ntfy_push(args.status_topic, body, title=f"HTK rig {rig_tag} up", tags="rocket")
+        name = ready[min(ready)]["name"] if ready else "?"
+        name = name.split(" (")[0].replace("NVIDIA GeForce ", "")
+
+        # max_value is the live chain target, written by chain_poller into the
+        # second half of job_buf. Difficulty = expected hashes per coin.
+        with job_lock:
+            mv = int.from_bytes(bytes(job_buf[32:64]), "big")
+        cost = ""
+        if mv and total > 0:
+            hashes = (1 << 256) // (mv + 1)
+            hours = hashes / total / 3600.0
+            line = f"{hours:,.0f}h/coin @ {hashes/1e12:,.0f} TH"
+            if dph > 0:
+                line += f" -> ${hours * dph:,.2f}/HTK"
+            cost = line
+        elif total > 0:
+            cost = "awaiting chain difficulty"
+
+        body = (f"{name} x{len(gpus)} | {total/1e9:.2f} GH/s"
+                + (f" | ${dph:.4f}/hr" if dph > 0 else "")
+                + (f"\n{cost}" if cost else ""))
+        log(f"UP {rig_tag}: {body}")
+        ntfy_push(args.status_topic, body, title=f"HTK {rig_tag} up", tags="rocket")
 
     try:
         while not stop_evt.is_set():
