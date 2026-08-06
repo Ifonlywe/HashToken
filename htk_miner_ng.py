@@ -806,8 +806,22 @@ class ShareReporter:
     def flush(self, now=None):
         msg = self.build(now)
         ok = ntfy_push(self.topic, json.dumps(msg))
-        self.pending = []
-        self.seen_total = 0
+        if ok:
+            self.pending = []
+            self.seen_total = 0
+        else:
+            # Do NOT discard on a failed publish. Those shares are the only
+            # evidence this rig is working; losing them makes it look slower
+            # than it is, and with value-based retirement armed the controller
+            # may kill a healthy rig over a transient network blip. Carry them
+            # to the next interval instead -- re-sent duplicates are rejected
+            # harmlessly by the controller's UNIQUE(nonce) constraint.
+            #
+            # Bounded, so a long outage cannot grow this without limit; the
+            # sample stays unbiased because it is drawn at random.
+            cap = MAX_SHARES_PER_BATCH * 5
+            if len(self.pending) > cap:
+                self.pending = random.sample(self.pending, cap)
         self.last = now or time.time()
         return ok, msg
 
