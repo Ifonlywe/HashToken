@@ -578,6 +578,14 @@ def run_miner(args, cu_source):
                 log(f"[rate] total {total/1000:.2f} GH/s  ({per} MH/s)")
                 last_print = time.time()
 
+            # A rig with no job is not mining at all -- the workers sit in a
+            # sleep loop waiting for prev_hash/max_value. It still heartbeats,
+            # so without saying so explicitly the controller cannot tell it
+            # apart from a slow rig until verify_grace (30 min) expires.
+            with job_lock:
+                _mv = int.from_bytes(bytes(job_buf[32:64]), "big")
+            reporter.err = None if _mv else "no_job"
+
             # Heartbeat and shares travel together, so "heartbeat with no
             # shares" is directly observable by the controller.
             if reporter.due():
@@ -769,6 +777,7 @@ class ShareReporter:
         self.restarts = 0
         self.found = 0
         self.rates = {}
+        self.err = None            # e.g. "no_job" when the chain is unreachable
 
     def add(self, msg):
         self.seen_total += int(msg.get("count", 0))
@@ -800,7 +809,7 @@ class ShareReporter:
             "gpus": [{"i": g, "n": n, "hr": round(self.rates.get(g, 0.0), 1)}
                      for g, n in sorted(self.gpus.items())],
             "prevs": prevs, "sh": sh,
-            "sc": self.seen_total, "nf": self.found, "err": None,
+            "sc": self.seen_total, "nf": self.found, "err": self.err,
         }
 
     def flush(self, now=None):
