@@ -522,6 +522,11 @@ def run_miner(args, cu_source):
                     found_log.write(json.dumps({"ts": time.time(), "nonce": nonce,
                                                 "prev_hash": msg["prev_hash"], "gpu": msg["gpu"]}) + "\n")
                     log(f"*** FOUND nonce 0x{nonce} (gpu{msg['gpu']}) ***")
+                    # Count it so the find shows up in the heartbeat's `nf`.
+                    # Without this the controller stays blind to the one event
+                    # the whole fleet exists to produce -- the nonce is still
+                    # pushed and minted correctly, but nothing reports it.
+                    reporter.found += 1
                     if args.dry_run:
                         log("  --dry-run: not pushing")
                     elif ntfy_push(NTFY_TOPIC, "0x" + nonce):
@@ -818,6 +823,10 @@ class ShareReporter:
         if ok:
             self.pending = []
             self.seen_total = 0
+            # NOTE: self.found is deliberately NOT reset. It is a lifetime count
+            # for this miner process, so a find stays visible in every later
+            # heartbeat rather than appearing in exactly one message that could
+            # be missed if the controller happens to be restarting.
         else:
             # Do NOT discard on a failed publish. Those shares are the only
             # evidence this rig is working; losing them makes it look slower
