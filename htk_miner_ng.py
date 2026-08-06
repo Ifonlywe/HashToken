@@ -488,7 +488,10 @@ def run_miner(args, cu_source):
                 + (f" | ${dph:.4f}/hr" if dph > 0 else "")
                 + (f"\n{cost}" if cost else ""))
         log(f"UP {rig_tag}: {body}")
-        ntfy_push(args.status_topic, body, title=f"HTK {rig_tag} up", tags="rocket")
+        # ntfy status alerts disabled by request -- the controller already sees
+        # every rig via the share topic, so these were duplicate phone noise.
+        # The log() above is unaffected; container logs still carry it.
+        # ntfy_push(args.status_topic, body, title=f"HTK {rig_tag} up", tags="rocket")
 
     try:
         while not stop_evt.is_set():
@@ -554,9 +557,12 @@ def run_miner(args, cu_source):
 
                 if n > MAX_RESTARTS:
                     log(f"[gpu{gpu_id}] GIVING UP after {MAX_RESTARTS} restarts — {err}")
-                    ntfy_push(args.status_topic,
-                              f"rig {rig_tag} gpu{gpu_id} DEAD after {MAX_RESTARTS} restarts\n{err}",
-                              title=f"HTK rig {rig_tag} gpu{gpu_id} dead", tags="rotating_light")
+                    # ntfy status alerts disabled by request. The controller
+                    # still catches this: all workers dying sets stop_evt, the
+                    # heartbeat stops, and the watchdog retires the rig.
+                    # ntfy_push(args.status_topic,
+                    #           f"rig {rig_tag} gpu{gpu_id} DEAD after {MAX_RESTARTS} restarts\n{err}",
+                    #           title=f"HTK rig {rig_tag} gpu{gpu_id} dead", tags="rotating_light")
                     procs.pop(gpu_id, None)
                     if not procs:
                         log("all GPU workers dead — exiting so the rig stops burning time")
@@ -565,9 +571,11 @@ def run_miner(args, cu_source):
 
                 delay = min(2 ** n, 60)
                 log(f"[gpu{gpu_id}] worker died ({n}/{MAX_RESTARTS}) — retry in {delay}s — {err}")
-                if n == 1:      # alert once, not on every retry
-                    ntfy_push(args.status_topic, f"rig {rig_tag} gpu{gpu_id} crashed: {err}",
-                              title=f"HTK rig {rig_tag} warning", tags="warning")
+                # ntfy status alerts disabled by request. A crash still shows
+                # up as `rst` in the heartbeat and as lost hashrate.
+                # if n == 1:      # alert once, not on every retry
+                #     ntfy_push(args.status_topic, f"rig {rig_tag} gpu{gpu_id} crashed: {err}",
+                #               title=f"HTK rig {rig_tag} warning", tags="warning")
                 stop_evt.wait(delay)
                 if stop_evt.is_set():
                     break
