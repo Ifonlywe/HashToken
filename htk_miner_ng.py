@@ -58,7 +58,7 @@ MAX_SHARES_PER_BATCH = 40      # ntfy message cap; reservoir-sampled if exceeded
 DEFAULT_HEARTBEAT = 120.0      # seconds between heartbeat+share messages
 REGION_BITS = 24               # per-rig nonce region, binds shares to a rig
 REGION_SHIFT = 40
-NTFY_TOPIC = "htk-nonce-a303558a1aa9e6043d43531d"
+NTFY_TOPIC = "htk-nonce-4a804bab208de70595acd0a7"
 STATUS_TOPIC = "htk-status-35cb5d56831536e9924deb7b"
 
 TARGET_LAUNCH_SECONDS = 2.0
