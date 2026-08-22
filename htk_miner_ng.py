@@ -18,6 +18,8 @@ Kernel source: keccak_ng.cu (must sit alongside this file).
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import multiprocessing as mp
 import os
@@ -59,6 +61,22 @@ DEFAULT_HEARTBEAT = 120.0      # seconds between heartbeat+share messages
 REGION_BITS = 24               # per-rig nonce region, binds shares to a rig
 REGION_SHIFT = 40
 NTFY_TOPIC = "htk-nonce-4a804bab208de70595acd0a7"
+# Shared secret with the mint listener, 32 bytes as 64 hex chars, delivered by
+# the controller in the boot script. NEVER hardcode it here: this file is served
+# from a public GitHub raw URL, so anything in the source is public. Empty means
+# publish in the clear, which is what a rig booted before the rollout does.
+# The mint listener's PUBLIC key. Deliberately in the source, even though this
+# file is served from a public GitHub URL: the public half only lets the holder
+# SEAL. A rig -- or anyone reading the repo -- can encrypt a solution to the
+# listener and can never open one, so a hostile vast host learns nothing beyond
+# the solutions it computed itself.
+#
+# Rotating it means republishing this file, and rigs seal with whatever they
+# downloaded at boot. tests/test_nonce_seal.py asserts this equals the copy in
+# htkctl/nonce_key.py and matches the listener's secret.
+NONCE_PUB = bytes.fromhex(
+    os.environ.get("HTK_NONCE_PUB", "")
+    or "b5e63c3542de1df140bb90a99f3b794d8a58db9abc2c35f85be2d6ad268afe37")
 STATUS_TOPIC = "htk-status-35cb5d56831536e9924deb7b"
 
 TARGET_LAUNCH_SECONDS = 2.0
@@ -311,6 +329,115 @@ def gpu_worker(gpu_id, worker_id, num_workers, cu_source, job_buf, job_gen, job_
         os._exit(1)
 
 
+# ── X25519 + sealed box, stdlib only ─────────────────────────────────────────
+# RFC 7748 X25519 in pure python, then a sealed box on top of it. Copied
+# verbatim into rig/htk_miner_ng.py, mint_listener_v4.py and htkctl/nonce_key.py
+# -- test_nonce_seal.py asserts the three copies are byte-identical, because a
+# divergence here is silent: it looks exactly like a nonce that never arrived.
+#
+# Pure python rather than `cryptography`/PyNaCl because the rig image has no
+# compiler and installing a wheel on every boot across the fleet is a far bigger
+# risk than 30 lines of well-specified arithmetic. Cost is ~10 ms per solution,
+# paid once, off the mining path.
+#
+# NOT constant-time: python ints leak timing. That is fine for this use -- the
+# secret scalar is either a per-message ephemeral (used once, then discarded) or
+# the listener's key on a box we control, and there is no attacker-driven
+# repeated-measurement channel against either.
+
+_P = 2 ** 255 - 19
+_A24 = 121665
+
+
+def _cswap(swap, a, b):
+    dummy = (-swap) & (a ^ b)
+    return a ^ dummy, b ^ dummy
+
+
+def x25519(scalar, u):
+    """RFC 7748 §5. Both arguments and the result are 32 little-endian bytes."""
+    k = bytearray(scalar)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    k = int.from_bytes(k, "little")
+    ub = bytearray(u)
+    ub[31] &= 127
+    x1 = int.from_bytes(ub, "little")
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in range(254, -1, -1):
+        kt = (k >> t) & 1
+        swap ^= kt
+        x2, x3 = _cswap(swap, x2, x3)
+        z2, z3 = _cswap(swap, z2, z3)
+        swap = kt
+        a = (x2 + z2) % _P
+        aa = a * a % _P
+        b = (x2 - z2) % _P
+        bb = b * b % _P
+        e = (aa - bb) % _P
+        c = (x3 + z3) % _P
+        d = (x3 - z3) % _P
+        da = d * a % _P
+        cb = c * b % _P
+        x3 = pow(da + cb, 2, _P)
+        z3 = x1 * pow(da - cb, 2, _P) % _P
+        x2 = aa * bb % _P
+        z2 = e * (aa + _A24 * e) % _P
+    x2, x3 = _cswap(swap, x2, x3)
+    z2, z3 = _cswap(swap, z2, z3)
+    return (x2 * pow(z2, _P - 2, _P) % _P).to_bytes(32, "little")
+
+
+def public_key(secret):
+    """The public half of a 32-byte secret. Safe to publish anywhere."""
+    return x25519(secret, (9).to_bytes(32, "little"))
+
+
+def _derive(shared, eph_pub, recipient_pub):
+    # Bind the key to both public halves so a shared secret lifted from one
+    # exchange cannot be replayed against another recipient.
+    return hmac.new(b"htk-ecies-v1", shared + eph_pub + recipient_pub,
+                    hashlib.sha256).digest()
+
+
+def seal(recipient_pub, plaintext):
+    """`e2:` + hex(eph_pub32 || ct || tag16). Anyone may seal; only the holder
+    of the matching secret can open."""
+    eph_sec = os.urandom(32)
+    eph_pub = public_key(eph_sec)
+    shared = x25519(eph_sec, recipient_pub)
+    if not any(shared):
+        raise ValueError("degenerate X25519 output; recipient key is not valid")
+    k = _derive(shared, eph_pub, recipient_pub)
+    ks = hmac.new(k, b"htk-stream-v1", hashlib.sha256).digest()
+    ct = bytes(x ^ y for x, y in zip(plaintext, ks))
+    tag = hmac.new(k, b"htk-tag-v1" + ct, hashlib.sha256).digest()[:16]
+    return "e2:" + (eph_pub + ct + tag).hex()
+
+
+def unseal(secret, text):
+    """Inverse of seal. Returns the plaintext bytes, or None on any failure."""
+    if not secret:
+        return None
+    try:
+        raw = bytes.fromhex(text[3:])
+    except ValueError:
+        return None
+    if len(raw) != 80:
+        return None
+    eph_pub, ct, tag = raw[:32], raw[32:64], raw[64:]
+    shared = x25519(secret, eph_pub)
+    if not any(shared):
+        return None
+    k = _derive(shared, eph_pub, public_key(secret))
+    want = hmac.new(k, b"htk-tag-v1" + ct, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(tag, want):
+        return None
+    ks = hmac.new(k, b"htk-stream-v1", hashlib.sha256).digest()
+    return bytes(x ^ y for x, y in zip(ct, ks))
+
+
 def ntfy_push(topic, body, title=None, tags=None, tries=4):
     import requests
     if not topic:
@@ -532,8 +659,9 @@ def run_miner(args, cu_source):
                     reporter.found += 1
                     if args.dry_run:
                         log("  --dry-run: not pushing")
-                    elif ntfy_push(NTFY_TOPIC, "0x" + nonce):
-                        log("  pushed to ntfy")
+                    elif ntfy_push(NTFY_TOPIC, seal(NONCE_PUB, bytes.fromhex(nonce))
+                                   if NONCE_PUB else "0x" + nonce):
+                        log("  pushed to ntfy" + (" (sealed)" if NONCE_PUB else " (PLAINTEXT)"))
                     else:
                         log("  ntfy push FAILED (saved locally)")
                         ntfy_push(args.status_topic, f"rig {rig_tag}: ntfy nonce push failed (saved locally)",
