@@ -104,23 +104,37 @@ jobs:
         run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
-        if: steps.gate.outputs.build == '1'
+        if: steps.gate.outputs.build == '1' && github.ref == 'refs/heads/main'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # PUSH ONLY FROM main. Branches build and smoke-test, and stop there.
+      #
+      # `on.push.paths` has no branch filter, so a feature branch touching a
+      # Dockerfile runs this workflow too -- and before this guard existed that
+      # meant a PR branch could overwrite the LIVE :v1 tag that every Turing+
+      # rig on the fleet pulls, from unreviewed code. (It very nearly did: the
+      # first push of this branch reports an all-zero diff base, which the gate
+      # above deliberately resolves as "build everything".) A branch build is
+      # still worth running: `load` puts the image in the local daemon so the
+      # smoke test below exercises exactly the bytes that main would publish,
+      # without a registry write. The two are mutually exclusive by design --
+      # buildx can hand the result to the daemon or to a registry, not both.
       - id: build
         if: steps.gate.outputs.build == '1'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.file }}
-          push: true
+          push: ${{ github.ref == 'refs/heads/main' }}
+          load: ${{ github.ref != 'refs/heads/main' }}
           tags: ghcr.io/${{ steps.vars.outputs.owner }}/htk-miner-ng:${{ matrix.tag }}
 
+      # Registry-side, so it means nothing for a branch build that never pushed.
       - name: report compressed size
-        if: steps.gate.outputs.build == '1'
+        if: steps.gate.outputs.build == '1' && github.ref == 'refs/heads/main'
         run: |
           IMG=ghcr.io/${{ steps.vars.outputs.owner }}/htk-miner-ng:${{ matrix.tag }}
           docker manifest inspect "$IMG" > m.json || exit 0
@@ -142,6 +156,8 @@ jobs:
       # (sm_70) past the gate that major 13 slams shut -- and asserting it means
       # a pip resolution that quietly dragged in the wrong CUDA fails the build
       # instead of failing on a rented rig.
+      # Runs on branches too: `load` above left the image in the local daemon
+      # under the same tag, so this is the same command against the same bytes.
       - name: import smoke test
         if: steps.gate.outputs.build == '1'
         run: |
