@@ -64,9 +64,15 @@ jobs:
       # and the v1 manifest digest with them -- which cold-caches every vast host
       # running Turing+ rigs for an image whose contents nobody meant to touch.
       #
-      # A change to the workflow itself still rebuilds both, which is the
-      # behaviour this file had before the matrix. workflow_dispatch always
-      # builds both: that is the manual "rebuild it anyway" handle.
+      # A change to THIS FILE does not rebuild anything, which is a deliberate
+      # break from the pre-matrix behaviour. Editing the workflow is how the 12x
+      # variant gets added at all, and under the old rule that single edit would
+      # have re-pushed :v1 as a side effect -- cold-caching the entire Turing+
+      # fleet to ship a change that does not touch their image. The workflow
+      # stays in `on.push.paths` so an edit still runs (and so GitHub validates
+      # it), it just resolves to "skip" on every leg whose Dockerfile is
+      # unchanged. workflow_dispatch is the handle for "rebuild it anyway",
+      # which is what to use after a workflow change that must reach the images.
       - id: gate
         run: |
           if [ "${{ github.event_name }}" != "push" ]; then
@@ -84,9 +90,8 @@ jobs:
           fi
           CHANGED=$(git diff --name-only "$BEFORE" "${{ github.sha }}")
           echo "changed files:"; echo "$CHANGED" | sed 's/^/  /'
-          if echo "$CHANGED" | grep -Fqx '${{ matrix.file }}' \
-             || echo "$CHANGED" | grep -Fqx '.github/workflows/build-miner-image.yml'; then
-            echo "reason=${{ matrix.file }} or the workflow changed" >> "$GITHUB_OUTPUT"
+          if echo "$CHANGED" | grep -Fqx '${{ matrix.file }}'; then
+            echo "reason=${{ matrix.file }} changed" >> "$GITHUB_OUTPUT"
             echo "build=1" >> "$GITHUB_OUTPUT"
           else
             echo "reason=${{ matrix.file }} unchanged" >> "$GITHUB_OUTPUT"
