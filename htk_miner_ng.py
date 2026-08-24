@@ -91,13 +91,63 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
+# Lowest compute capability each NVRTC major version will accept for -arch.
+# NVRTC only ever REMOVES architectures at a major bump: CUDA 12.0 dropped
+# Kepler (sm_35/37) and CUDA 13.0 dropped Maxwell, Pascal AND Volta, leaving
+# sm_75 as both the minimum and the default. rig/Dockerfile pins
+# cuda-toolkit 13.*, which is why a Tesla V100 (sm_70) cannot be compiled for
+# on the current image at all -- see _compile_kernel below.
+_NVRTC_MIN_CC = {11: 35, 12: 50, 13: 75}
+
+
+def _nvrtc_min_cc(cp):
+    """(lowest compute capability this image's NVRTC accepts, version string).
+
+    Read from the installed toolkit rather than hardcoded, so that pointing the
+    image back at a 12.x toolkit makes Volta work again with no edit here. An
+    unknown (newer) major is assumed to be at least as strict as the strictest
+    we know about, because majors only ever drop architectures. If the version
+    cannot be read at all, return 0: never block a compile that might work.
+    """
+    try:
+        ver = cp.cuda.nvrtc.getVersion()
+    except Exception:
+        return 0, "unknown"
+    return (_NVRTC_MIN_CC.get(ver[0], max(_NVRTC_MIN_CC.values())),
+            ".".join(str(v) for v in ver))
+
+
 def _compile_kernel(cu_source):
     import cupy as cp
     try:
-        cc = cp.cuda.Device().compute_capability
-        arch = (f"-arch=sm_{cc}",)
+        cc = cp.cuda.Device().compute_capability      # "70" on a V100
     except Exception:
-        arch = ()
+        cc = None
+    # Refuse a card this toolkit cannot target, here and loudly, rather than 20
+    # lines down as NVRTC's opaque "invalid value for --gpu-architecture
+    # (-arch)". This is NOT an -arch spelling we can talk our way out of:
+    #   * cupy appends its OWN -arch to whatever we pass, twice and from the
+    #     device's compute capability, so an -arch in `options` below never
+    #     wins: _preprocess() adds -arch=compute_<cc> for its cache-key probe
+    #     and _get_arch_for_options_for_nvrtc() adds -arch=sm_<cc> for the real
+    #     build. The V100 log dies in the FIRST of those, on compute_70;
+    #   * so no, compute_70 is not the way out. CUDA 13 removed Volta from the
+    #     compiler entirely, virtual architecture included, and there is no
+    #     emit-PTX-and-let-the-driver-JIT escape hatch;
+    #   * and targeting sm_75 instead would not help: PTX and SASS are forward
+    #     compatible only, so 75 code does not run on a 70 card.
+    # nvcc would fail the same way, so this gate covers both backends. The only
+    # real fixes are a cuda-12x rig image or not renting the model.
+    min_cc, nvrtc_ver = _nvrtc_min_cc(cp)
+    if cc is not None and int(cc) < min_cc:
+        raise RuntimeError(
+            f"UNSUPPORTED_GPU: sm_{cc} is older than sm_{min_cc}, the oldest "
+            f"architecture NVRTC {nvrtc_ver} in this image can target. Neither "
+            f"-arch=sm_{cc} nor -arch=compute_{cc} is accepted, and code built "
+            f"for sm_{min_cc} will not run on this card, so nothing this rig "
+            f"compiles can mine. Needs a cuda-12x image, or this GPU model "
+            f"should not be in gpu_names.")
+    arch = (f"-arch=sm_{cc}",) if cc is not None else ()
     # The kernel is extern "C", so its symbol is unmangled and name_expressions
     # is unnecessary — passing it would make the nvcc backend reject the module.
     try:
@@ -116,6 +166,10 @@ def _compile_kernel(cu_source):
             # which breaks every rig on an image without nvcc. NVRTC already
             # optimises by default, and Phase -1 measured this path within
             # 0.03% of nvcc on a 5090 using exactly these options.
+            # No -arch here on purpose, and adding one changes nothing: cupy
+            # always appends its own, derived from the current device. So an
+            # -arch error CAN surface from this call even though the options
+            # tuple has none -- that is the gate above firing late, not a typo.
             mod = cp.RawModule(code=stripped, backend="nvrtc",
                                options=("-std=c++14",))
             return mod.get_function(KERNEL_NAME)
