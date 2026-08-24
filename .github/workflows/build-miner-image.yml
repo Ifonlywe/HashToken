@@ -1,22 +1,32 @@
-# Build and publish the slim next-gen miner image to ghcr.io.
+# Build and publish the slim next-gen miner images to ghcr.io.
 #
 # Install at .github/workflows/build-miner-image.yml
 #
-# AFTER THE FIRST SUCCESSFUL RUN the package must be made PUBLIC, or vast.ai
-# cannot pull it:
+# TWO VARIANTS, ONE PACKAGE, TWO TAGS:
+#
+#   Dockerfile          -> ghcr.io/<owner>/htk-miner-ng:v1          CUDA 13.x
+#   Dockerfile.cuda12x  -> ghcr.io/<owner>/htk-miner-ng:v1-cuda12   CUDA 12.x
+#
+# They are the same package, so the ONE-TIME "make public" step already done for
+# htk-miner-ng covers both -- ghcr visibility is per PACKAGE, not per tag, and a
+# new tag on an already-public package is anonymously pullable the moment it is
+# pushed. That is the main reason the 12x variant is a second TAG rather than a
+# second package (htk-miner-ng-cuda12x would have needed the manual step again,
+# and until someone did it every legacy rental would burn its boot on a 403):
 #   github.com/users/<owner>/packages/container/htk-miner-ng/settings
 #   -> Danger Zone -> Change visibility -> Public
 #
-# The tag is pinned to v1 on purpose. Every distinct tag is a separate host-side
-# image cache entry; bumping it makes every vast host cold again. Bump only when
-# the BAKED DEPENDENCIES change -- miner source changes are fetched at boot and
-# need no rebuild.
+# Tags are pinned to v1 / v1-cuda12 on purpose. Every distinct tag is a separate
+# host-side image cache entry; bumping one makes every vast host cold again for
+# that variant. Bump only when the BAKED DEPENDENCIES change -- miner source
+# changes are fetched at boot and need no rebuild.
 name: build miner image
 
 on:
   push:
     paths:
       - Dockerfile
+      - Dockerfile.cuda12x
       - .github/workflows/build-miner-image.yml
   workflow_dispatch:
 
@@ -26,32 +36,93 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      # Independent variants: a broken 12x build must not stop the 13x image
+      # from shipping, and vice versa.
+      fail-fast: false
+      matrix:
+        include:
+          # expect_major is asserted in the smoke test below. Silently getting
+          # the wrong CUDA major into a tag is the exact failure this whole
+          # two-image split exists to prevent, and it is invisible until a rig
+          # pays to pull the image and then cannot compile.
+          - { file: Dockerfile,         tag: v1,        expect_major: 13 }
+          - { file: Dockerfile.cuda12x, tag: v1-cuda12, expect_major: 12 }
     steps:
+      # fetch-depth 0 so the "did MY dockerfile change" check below can diff
+      # against the push's base commit.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ONLY REBUILD THE VARIANT THAT CHANGED.
+      #
+      # GitHub applies `on.push.paths` to the workflow, not to a matrix leg, so
+      # without this a one-line edit to Dockerfile.cuda12x would also re-push the
+      # v1 tag. That is not harmless: pip would re-resolve "cuda-toolkit==13.*"
+      # and "==12.*" to whatever patch is current, the layer digests would move,
+      # and the v1 manifest digest with them -- which cold-caches every vast host
+      # running Turing+ rigs for an image whose contents nobody meant to touch.
+      #
+      # A change to the workflow itself still rebuilds both, which is the
+      # behaviour this file had before the matrix. workflow_dispatch always
+      # builds both: that is the manual "rebuild it anyway" handle.
+      - id: gate
+        run: |
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "reason=manual dispatch" >> "$GITHUB_OUTPUT"
+            echo "build=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          BEFORE="${{ github.event.before }}"
+          # A brand-new branch reports an all-zero base, and a force-push can
+          # leave a base commit that no longer exists. Neither is a diff we can
+          # trust, so fall back to building rather than silently skipping.
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "reason=no usable diff base" >> "$GITHUB_OUTPUT"
+            echo "build=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BEFORE" "${{ github.sha }}")
+          echo "changed files:"; echo "$CHANGED" | sed 's/^/  /'
+          if echo "$CHANGED" | grep -Fqx '${{ matrix.file }}' \
+             || echo "$CHANGED" | grep -Fqx '.github/workflows/build-miner-image.yml'; then
+            echo "reason=${{ matrix.file }} or the workflow changed" >> "$GITHUB_OUTPUT"
+            echo "build=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "reason=${{ matrix.file }} unchanged" >> "$GITHUB_OUTPUT"
+            echo "build=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.gate.outputs.build == '0'
+        run: echo "skipping ${{ matrix.tag }} -- ${{ steps.gate.outputs.reason }}"
 
       # OCI repository names must be lowercase, and the GitHub owner is
       # "Ifonlywe". github.repository_owner preserves that capital I, which
       # buildx rejects outright.
       - id: vars
+        if: steps.gate.outputs.build == '1'
         run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
+        if: steps.gate.outputs.build == '1'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: build
+        if: steps.gate.outputs.build == '1'
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile
+          file: ${{ matrix.file }}
           push: true
-          tags: ghcr.io/${{ steps.vars.outputs.owner }}/htk-miner-ng:v1
+          tags: ghcr.io/${{ steps.vars.outputs.owner }}/htk-miner-ng:${{ matrix.tag }}
 
       - name: report compressed size
+        if: steps.gate.outputs.build == '1'
         run: |
-          IMG=ghcr.io/${{ steps.vars.outputs.owner }}/htk-miner-ng:v1
+          IMG=ghcr.io/${{ steps.vars.outputs.owner }}/htk-miner-ng:${{ matrix.tag }}
           docker manifest inspect "$IMG" > m.json || exit 0
           python3 - <<'PY'
           import json
@@ -63,14 +134,30 @@ jobs:
       # A GPU-less smoke test: the image must at least import cupy and report a
       # coherent "no CUDA device" error rather than a missing-module traceback.
       # Catches a broken wheel set before any rig pays to pull it.
+      #
+      # It also asserts the NVRTC MAJOR, which needs no GPU (nvrtcVersion() is a
+      # library call, not a driver call) and is the single fact that decides
+      # which cards this tag can mine on. htk_miner_ng.py's _NVRTC_MIN_CC maps
+      # {11: 35, 12: 50, 13: 75}, so major 12 here is exactly what lets a V100
+      # (sm_70) past the gate that major 13 slams shut -- and asserting it means
+      # a pip resolution that quietly dragged in the wrong CUDA fails the build
+      # instead of failing on a rented rig.
       - name: import smoke test
+        if: steps.gate.outputs.build == '1'
         run: |
-          docker run --rm ghcr.io/${{ steps.vars.outputs.owner }}/htk-miner-ng:v1 \
+          docker run --rm \
+            ghcr.io/${{ steps.vars.outputs.owner }}/htk-miner-ng:${{ matrix.tag }} \
             python3 -c "
           import cupy, numpy, requests
           print('cupy', cupy.__version__, '| numpy', numpy.__version__)
           from cupy.cuda import nvrtc
           print('nvrtc binding present:', bool(nvrtc))
+          ver = nvrtc.getVersion()
+          print('nvrtc version:', '.'.join(str(v) for v in ver))
+          want = ${{ matrix.expect_major }}
+          assert ver[0] == want, f'expected NVRTC major {want}, got {ver}'
+          min_cc = {11: 35, 12: 50, 13: 75}[ver[0]]
+          print('oldest targetable arch: sm_%d' % min_cc)
           try:
               n = cupy.cuda.runtime.getDeviceCount()
               print('devices:', n)

@@ -1,0 +1,74 @@
+# Slim runtime image for the HashToken next-gen miner -- CUDA 12.x variant.
+#
+# This is a deliberate FORK of ./Dockerfile, not a replacement, and the two are
+# published side by side under different tags (v1 and v1-cuda12). Everything
+# here is byte-for-byte the 13x image except the two version pins below.
+#
+# WHY A SECOND IMAGE AND NOT ONE IMAGE THAT DOES BOTH:
+# CUDA 13.0 removed Maxwell, Pascal AND Volta from the compiler outright --
+# sm_75 is now both NVRTC's minimum and its default, and even the compute_70
+# VIRTUAL arch is gone, so there is no -arch spelling, no emit-PTX-and-let-the-
+# driver-JIT escape hatch, and nothing htk_miner_ng.py can pass that makes a
+# Tesla V100 compile under the v1 image. A rented V100 got as far as
+# `_compile_kernel` and died on "invalid value for --gpu-architecture (-arch)".
+# The only fix is an older toolkit, and an older toolkit cannot be layered into
+# the v1 image: installing cupy-cuda12x over cupy-cuda13x is the "multiple CuPy
+# packages" collision that ./Dockerfile warns about. That constraint is about
+# ONE image; two separate images are exactly how it is meant to be resolved.
+#
+# The miner needs no #ifdef for this. `_nvrtc_min_cc()` reads the minimum
+# supported compute capability out of the INSTALLED toolkit at runtime
+# (_NVRTC_MIN_CC = {11: 35, 12: 50, 13: 75}), so the same htk_miner_ng.py that
+# refuses sm_70 under v1 accepts it here, with no branch and no edit.
+#
+#   base python:3.12-slim              40 MB
+#   cupy-cuda12x + numpy + requests    ~90 MB
+#   cuda-toolkit[cudart,nvrtc]==12.*   ~55 MB
+#
+# WHAT THIS IMAGE IS FOR: pre-Turing cards (compute capability < 7.5) --
+# Volta (V100, Titan V), Pascal (P100, P40, GTX 10xx, Titan Xp), Maxwell.
+# CUDA 12.x NVRTC targets sm_50 through sm_90, which covers all of them.
+# Turing and newer keep using v1: same kernel, newer toolkit, warm host caches.
+# htkctl/config.py LEGACY_GPUS is the list that decides which offers land here.
+#
+# NO CUDA TOOLKIT, NO nvcc -- same as v1. Measured on an RTX 5090, the NVRTC
+# fallback in _compile_kernel() is within 0.03% of nvcc, which is what makes
+# dropping ~8 GB possible. libcuda.so and nvidia-smi come from the HOST via the
+# NVIDIA container runtime, not from this image. That is also why this image
+# does NOT need an old host driver: a CUDA 12.x runtime runs on any driver that
+# reports CUDA >= 12.0 (minor version compatibility), which is why the hunter's
+# legacy search floor is min_cuda 12.0 and not something lower.
+#
+# The MINER SOURCE is deliberately NOT baked in -- rig_boot fetches it at boot.
+# That keeps this tag frozen so host image caches accumulate, while miner changes
+# ship without a rebuild.
+FROM python:3.12-slim
+
+# No apt at all. python:3.12-slim already ships ca-certificates (pip could not
+# do HTTPS otherwise), and the boot script uses urllib rather than curl -- so
+# there is nothing to install. That removes an apt round-trip from the build and
+# a layer from the image.
+
+# Pinned so the tag is reproducible and host caches stay valid.
+# cuda-toolkit is installed with ONLY cudart and nvrtc -- cublas, cufft, curand,
+# cusolver and cusparse are several hundred MB and this kernel uses none of them.
+#
+# cupy 14.1.1 and numpy/requests are held at the SAME versions as ./Dockerfile
+# on purpose: the only intended difference between the two images is the CUDA
+# major, so a behaviour difference between a v1 rig and a v1-cuda12 rig can be
+# attributed to the toolkit and nothing else.
+#
+# requests must stay. The miner's chain poller needs it; a build without it
+# fails every RPC with ModuleNotFoundError and the rig mines nothing.
+RUN pip install --no-cache-dir \
+        "cupy-cuda12x==14.1.1" \
+        "numpy==2.2.6" \
+        "requests==2.34.2" \
+        "cuda-toolkit[cudart,nvrtc]==12.*"
+
+# CuPy JIT-compiles the kernel on first use; give it a writable cache.
+ENV CUPY_CACHE_DIR=/opt/cupy-cache
+RUN mkdir -p /opt/cupy-cache && chmod 777 /opt/cupy-cache
+
+ENV PYTHONUNBUFFERED=1
+WORKDIR /workspace
