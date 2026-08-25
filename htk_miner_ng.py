@@ -49,7 +49,20 @@ READ_RPCS = [
     "https://1rpc.io/eth",
 ]
 
-NTFY_BASE = "https://ntfy.sh"
+NTFY_HOST = "ntfy.sh"
+NTFY_BASE = f"https://{NTFY_HOST}"
+# Addresses to reach NTFY_HOST by when the local resolver cannot name it -- see
+# ntfy_push. DoH endpoints are addressed by IP literal on purpose: a resolver
+# you have to resolve first is no use when resolution is what is broken. Both
+# answer the JSON API (no DNS wire format to hand-roll) and both present certs
+# carrying their own address in a SAN, so verification stays on for the lookup
+# itself as well.
+NTFY_DOH = ["https://1.1.1.1/dns-query", "https://8.8.8.8/resolve"]
+# Last resort, for a host that also blackholes the public resolvers to force
+# its own. ntfy.sh is a single DigitalOcean host, not an anycast CDN, so this
+# address CAN change under us; it is deliberately tried last so a stale pin can
+# never shadow a live DoH answer.
+NTFY_PINNED_IPS = ["159.203.148.75"]
 # --- next-gen additions ----------------------------------------------------
 # Share proof: rigs emit hashes clearing a far easier target so the controller
 # can verify they are actually hashing. See hashtoken-next-gen/docs/selection.md
@@ -492,7 +505,114 @@ def unseal(secret, text):
     return bytes(x ^ y for x, y in zip(ct, ks))
 
 
+_NTFY_IPS = None            # cached DoH answer for NTFY_HOST; None = not looked up
+_NTFY_ADAPTER = None        # cached adapter class, built lazily (see below)
+
+
+def _ntfy_sni_adapter():
+    """Adapter class that connects to the address in the URL but speaks TLS as
+    NTFY_HOST.
+
+    Built lazily and cached, because requests is a function-local import
+    everywhere in this file: the module has to import on a box with no requests
+    installed (tests/test_rig_protocol.py loads it directly to compare against
+    the controller).
+
+    server_hostname is the SNI actually sent; assert_hostname is the name the
+    presented certificate is checked against. Pinning both to ntfy.sh makes this
+    connection exactly as verified as an ordinary one -- it only skips the
+    resolver. That is why there is no verify=False anywhere on this path: it
+    carries every share and heartbeat the rig will ever emit, for the whole life
+    of the rental, so turning verification off would trade a DNS outage for a
+    standing MITM window on the rig's only channel home.
+    """
+    global _NTFY_ADAPTER
+    if _NTFY_ADAPTER is None:
+        import requests.adapters
+
+        class _NtfySNIAdapter(requests.adapters.HTTPAdapter):
+            def __init__(self, server_hostname, **kw):
+                self._sni = server_hostname
+                super().__init__(**kw)
+
+            def init_poolmanager(self, *a, **kw):
+                kw["server_hostname"] = self._sni
+                kw["assert_hostname"] = self._sni
+                return super().init_poolmanager(*a, **kw)
+
+        _NTFY_ADAPTER = _NtfySNIAdapter
+    return _NTFY_ADAPTER
+
+
+def _ntfy_addresses():
+    """Addresses to try for NTFY_HOST: DoH answers first, pinned literal last.
+
+    Deliberately NOT cached when every DoH query failed, so a transient failure
+    of both resolvers does not pin this process to the hardcoded literal for the
+    rest of the rental.
+    """
+    global _NTFY_IPS
+    if _NTFY_IPS is not None:
+        return _NTFY_IPS
+    import requests
+    out = []
+    for url in NTFY_DOH:
+        try:
+            r = requests.get(url, params={"name": NTFY_HOST, "type": "A"},
+                             headers={"Accept": "application/dns-json"}, timeout=8)
+            r.raise_for_status()
+            for ans in r.json().get("Answer", []):
+                # type 1 == A. A CNAME chain comes back in the same Answer list,
+                # so filtering on the record type resolves the chain in one query
+                # and never yields a name we would have to resolve again.
+                if ans.get("type") == 1 and ans.get("data") not in out:
+                    out.append(ans["data"])
+        except Exception as e:
+            log(f"[ntfy] DoH lookup at {url} failed: {type(e).__name__}: {e}")
+    resolved = bool(out)
+    for ip in NTFY_PINNED_IPS:
+        if ip not in out:
+            out.append(ip)
+    if resolved:
+        _NTFY_IPS = out
+    return out
+
+
+def _ntfy_post_ip(ip, topic, data, headers, timeout=15):
+    """POST one message to NTFY_HOST reached at `ip`. Raises on any failure."""
+    import requests
+    sess = requests.Session()
+    sess.mount("https://", _ntfy_sni_adapter()(NTFY_HOST))
+    h = dict(headers)
+    # The URL's authority is an address, so the real name has to travel in the
+    # Host header or ntfy has no idea which vhost -- and which topic -- is meant.
+    h["Host"] = NTFY_HOST
+    try:
+        sess.post(f"https://{ip}/{topic}", data=data, headers=h,
+                  timeout=timeout).raise_for_status()
+    finally:
+        sess.close()
+
+
 def ntfy_push(topic, body, title=None, tags=None, tries=4):
+    """Publish one message, with a failover of ntfy's own.
+
+    read_state_failover has five RPC domains to rotate through; ntfy had one
+    hardcoded hostname and nothing behind it. That asymmetry cost a rig:
+    machine 7646 passed its self-test against a live prev_hash, held ~6.3 GH/s
+    and accumulated real shares, while every heartbeat logged published=False,
+    because that host could reach all five RPC domains but could not resolve
+    "ntfy.sh" specifically. The controller saw nothing at all and retired it as
+    boot_timeout three times running -- a fully billed, fully working rig killed
+    by one name lookup.
+
+    The failover cannot be another domain (the topic only exists on ntfy.sh), so
+    it is the same host reached WITHOUT the local resolver: look the address up
+    over DoH against fixed resolver IPs, then connect straight to it with TLS
+    still verified against the real name. Tried only after the normal hostname
+    attempts are exhausted, so a host with working DNS behaves exactly as before
+    and never pays for a DoH lookup.
+    """
     import requests
     if not topic:
         return False
@@ -501,14 +621,36 @@ def ntfy_push(topic, body, title=None, tags=None, tries=4):
         headers["Title"] = title
     if tags:
         headers["Tags"] = tags
+    data = body.encode()
     delay = 1.0
-    for _ in range(tries):
+    for attempt in range(1, tries + 1):
         try:
-            requests.post(f"{NTFY_BASE}/{topic}", data=body.encode(), headers=headers, timeout=15).raise_for_status()
+            requests.post(f"{NTFY_BASE}/{topic}", data=data, headers=headers,
+                          timeout=15).raise_for_status()
             return True
-        except Exception:
-            time.sleep(delay)
-            delay = min(delay * 2, 15)
+        except Exception as e:
+            # This used to be a bare `except Exception: pass`, and that silence
+            # is what made 7646 expensive: the log recorded only that heartbeats
+            # were not arriving, so the cause had to be inferred from what did
+            # NOT happen. One line here names it outright -- DNS vs timeout vs
+            # refused vs TLS vs an HTTP status -- which is the whole difference
+            # between reading the answer and re-deriving it.
+            log(f"[ntfy] publish to {NTFY_HOST}/{topic} failed "
+                f"(attempt {attempt}/{tries}): {type(e).__name__}: {e}")
+            if attempt < tries:
+                time.sleep(delay)
+                delay = min(delay * 2, 15)
+    for ip in _ntfy_addresses():
+        try:
+            _ntfy_post_ip(ip, topic, data, headers)
+            log(f"[ntfy] published to {topic} via {ip} (hostname path is down)")
+            return True
+        except Exception as e:
+            log(f"[ntfy] publish via {ip} failed: {type(e).__name__}: {e}")
+    # Every address failed too. Drop the cache so the next interval re-queries
+    # DoH rather than retrying an address that has stopped serving this host.
+    global _NTFY_IPS
+    _NTFY_IPS = None
     return False
 
 
