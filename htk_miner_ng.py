@@ -10,7 +10,8 @@ Differences from the original htk_cuda_miner.py in this repo:
   * Dual-target kernel: emits "shares" clearing a much easier target, letting a
     controller verify the rig is genuinely hashing. Measured cost on an RTX 5090
     is 0.17% throughput and +4 registers.
-  * Batched heartbeat+share reporting to an ntfy topic.
+  * Batched heartbeat+share reporting to an ntfy topic, with a Telegram
+    failover for hosts that block ntfy.sh outright.
 
 Kernel source: keccak_ng.cu (must sit alongside this file).
 """
@@ -51,18 +52,30 @@ READ_RPCS = [
 
 NTFY_HOST = "ntfy.sh"
 NTFY_BASE = f"https://{NTFY_HOST}"
-# Addresses to reach NTFY_HOST by when the local resolver cannot name it -- see
-# ntfy_push. DoH endpoints are addressed by IP literal on purpose: a resolver
-# you have to resolve first is no use when resolution is what is broken. Both
-# answer the JSON API (no DNS wire format to hand-roll) and both present certs
-# carrying their own address in a SAN, so verification stays on for the lookup
-# itself as well.
-NTFY_DOH = ["https://1.1.1.1/dns-query", "https://8.8.8.8/resolve"]
-# Last resort, for a host that also blackholes the public resolvers to force
-# its own. ntfy.sh is a single DigitalOcean host, not an anycast CDN, so this
-# address CAN change under us; it is deliberately tried last so a stale pin can
-# never shadow a live DoH answer.
-NTFY_PINNED_IPS = ["159.203.148.75"]
+# --- Telegram failover -----------------------------------------------------
+# What replaced the DoH + pinned-IP failover that used to live here. That
+# approach could only rescue a host which failed to RESOLVE ntfy.sh; a host that
+# blackholes the address itself is untouched by a pinned literal, because a
+# pinned IP cannot route around a blocked IP. Telegram is a different network:
+# api.telegram.org is anycast and Cloudflare-fronted, so a host has to be
+# actively hostile to block it, and the connection is ordinary verified TLS to a
+# name the host's own resolver will answer.
+#
+# Both values arrive from the boot script's env (htkctl/onstart.py), NEVER
+# hardcoded, for the same reason as the nonce secret: this file is served from a
+# public GitHub raw URL, so anything written here is public. Empty means no
+# failover, which is what a rig booted before this rollout does.
+TG_TOKEN = os.environ.get("HTK_TG_TOKEN", "")
+TG_CHAT = os.environ.get("HTK_TG_CHAT", "")
+TG_API = "https://api.telegram.org"
+TG_MAX_TEXT = 4096         # Telegram's hard cap on sendMessage text
+# Telegram allows roughly 20 messages per minute into one channel, shared by the
+# WHOLE fleet. A 60s heartbeat from even fifteen fallback rigs would exhaust it
+# and start collecting 429s, so heartbeats are throttled to one per this many
+# seconds on the Telegram path only. 300 sits comfortably inside the
+# controller's stale_grace of 600, so a throttled rig still reads as alive and
+# is never destroyed for it. Solutions are exempt -- see telegram_push.
+TG_MIN_INTERVAL = 300.0
 # --- next-gen additions ----------------------------------------------------
 # Share proof: rigs emit hashes clearing a far easier target so the controller
 # can verify they are actually hashing. See hashtoken-next-gen/docs/selection.md
@@ -70,6 +83,11 @@ SHARE_TOPIC = "htk-share-9c41e07b5d2a"
 DEFAULT_SHARE_BITS = 36        # ~1 share per 2**36 hashes = ~5.1/min per 5090
 SHARE_CAP = 64                 # device ring buffer slots (expected ~0.17/launch)
 MAX_SHARES_PER_BATCH = 40      # ntfy message cap; reservoir-sampled if exceeded
+# Hard ceiling on one serialised heartbeat, under BOTH transports' 4096 limit
+# with room for the "<topic>\n" prefix telegram_push prepends. ShareReporter.build
+# sheds shares until the message fits; see the note there for why 40 shares is
+# not by itself a small enough batch.
+MAX_MSG_BYTES = 4000
 DEFAULT_HEARTBEAT = 120.0      # seconds between heartbeat+share messages
 REGION_BITS = 24               # per-rig nonce region, binds shares to a rig
 REGION_SHIFT = 40
@@ -505,97 +523,57 @@ def unseal(secret, text):
     return bytes(x ^ y for x, y in zip(ct, ks))
 
 
-_NTFY_IPS = None            # cached DoH answer for NTFY_HOST; None = not looked up
-_NTFY_ADAPTER = None        # cached adapter class, built lazily (see below)
+_TG_LAST = {}               # topic -> last successful Telegram send, for the throttle
 
 
-def _ntfy_sni_adapter():
-    """Adapter class that connects to the address in the URL but speaks TLS as
-    NTFY_HOST.
+def telegram_push(topic, body):
+    """Send one message to the Telegram channel. Returns True/False.
 
-    Built lazily and cached, because requests is a function-local import
-    everywhere in this file: the module has to import on a box with no requests
-    installed (tests/test_rig_protocol.py loads it directly to compare against
-    the controller).
+    The topic name travels as the first line so the controller can put the
+    message back on the exact ntfy topic it was meant for -- shares, status and
+    solutions all share this one channel, and only the prefix distinguishes
+    them. The controller does that relay in htkctl/__main__.py, which is why
+    nothing downstream of ntfy had to learn about Telegram at all.
 
-    server_hostname is the SNI actually sent; assert_hostname is the name the
-    presented certificate is checked against. Pinning both to ntfy.sh makes this
-    connection exactly as verified as an ordinary one -- it only skips the
-    resolver. That is why there is no verify=False anywhere on this path: it
-    carries every share and heartbeat the rig will ever emit, for the whole life
-    of the rental, so turning verification off would trade a DNS outage for a
-    standing MITM window on the rig's only channel home.
+    The throttle deliberately does NOT apply to the solution topic. A nonce is
+    the one message the entire fleet exists to produce, it happens perhaps once
+    across thousands of rig-hours, and it is far too rare to threaten a rate
+    limit. Heartbeats are the opposite on every count, so they are the ones that
+    wait. Returning False when throttled is correct and not a lie: ShareReporter
+    treats a False as "carry these shares to the next interval", so the batch is
+    held and folded into the next Telegram message rather than dropped.
     """
-    global _NTFY_ADAPTER
-    if _NTFY_ADAPTER is None:
-        import requests.adapters
-
-        class _NtfySNIAdapter(requests.adapters.HTTPAdapter):
-            def __init__(self, server_hostname, **kw):
-                self._sni = server_hostname
-                super().__init__(**kw)
-
-            def init_poolmanager(self, *a, **kw):
-                kw["server_hostname"] = self._sni
-                kw["assert_hostname"] = self._sni
-                return super().init_poolmanager(*a, **kw)
-
-        _NTFY_ADAPTER = _NtfySNIAdapter
-    return _NTFY_ADAPTER
-
-
-def _ntfy_addresses():
-    """Addresses to try for NTFY_HOST: DoH answers first, pinned literal last.
-
-    Deliberately NOT cached when every DoH query failed, so a transient failure
-    of both resolvers does not pin this process to the hardcoded literal for the
-    rest of the rental.
-    """
-    global _NTFY_IPS
-    if _NTFY_IPS is not None:
-        return _NTFY_IPS
     import requests
-    out = []
-    for url in NTFY_DOH:
-        try:
-            r = requests.get(url, params={"name": NTFY_HOST, "type": "A"},
-                             headers={"Accept": "application/dns-json"}, timeout=8)
-            r.raise_for_status()
-            for ans in r.json().get("Answer", []):
-                # type 1 == A. A CNAME chain comes back in the same Answer list,
-                # so filtering on the record type resolves the chain in one query
-                # and never yields a name we would have to resolve again.
-                if ans.get("type") == 1 and ans.get("data") not in out:
-                    out.append(ans["data"])
-        except Exception as e:
-            log(f"[ntfy] DoH lookup at {url} failed: {type(e).__name__}: {e}")
-    resolved = bool(out)
-    for ip in NTFY_PINNED_IPS:
-        if ip not in out:
-            out.append(ip)
-    if resolved:
-        _NTFY_IPS = out
-    return out
-
-
-def _ntfy_post_ip(ip, topic, data, headers, timeout=15):
-    """POST one message to NTFY_HOST reached at `ip`. Raises on any failure."""
-    import requests
-    sess = requests.Session()
-    sess.mount("https://", _ntfy_sni_adapter()(NTFY_HOST))
-    h = dict(headers)
-    # The URL's authority is an address, so the real name has to travel in the
-    # Host header or ntfy has no idea which vhost -- and which topic -- is meant.
-    h["Host"] = NTFY_HOST
+    if not (TG_TOKEN and TG_CHAT):
+        return False
+    now = time.time()
+    if topic != NTFY_TOPIC:
+        if now - _TG_LAST.get(topic, 0.0) < TG_MIN_INTERVAL:
+            return False
+    text = f"{topic}\n{body}"
+    if len(text) > TG_MAX_TEXT:
+        # Should not happen: ShareReporter.build caps the batch well below this.
+        # Truncating would hand the controller unparseable JSON, so refuse and
+        # let the caller retry with a smaller batch next interval.
+        log(f"[tg] message for {topic} is {len(text)} chars, over the "
+            f"{TG_MAX_TEXT} cap; not sending")
+        return False
     try:
-        sess.post(f"https://{ip}/{topic}", data=data, headers=h,
-                  timeout=timeout).raise_for_status()
-    finally:
-        sess.close()
+        r = requests.post(f"{TG_API}/bot{TG_TOKEN}/sendMessage",
+                          data={"chat_id": TG_CHAT, "text": text,
+                                "disable_notification": "true"},
+                          timeout=20)
+        r.raise_for_status()
+        _TG_LAST[topic] = now
+        log(f"[tg] published to {topic} via Telegram (ntfy is unreachable)")
+        return True
+    except Exception as e:
+        log(f"[tg] publish to {topic} failed: {type(e).__name__}: {e}")
+        return False
 
 
 def ntfy_push(topic, body, title=None, tags=None, tries=4):
-    """Publish one message, with a failover of ntfy's own.
+    """Publish one message, falling back to Telegram if ntfy is unreachable.
 
     read_state_failover has five RPC domains to rotate through; ntfy had one
     hardcoded hostname and nothing behind it. That asymmetry cost a rig:
@@ -606,12 +584,11 @@ def ntfy_push(topic, body, title=None, tags=None, tries=4):
     boot_timeout three times running -- a fully billed, fully working rig killed
     by one name lookup.
 
-    The failover cannot be another domain (the topic only exists on ntfy.sh), so
-    it is the same host reached WITHOUT the local resolver: look the address up
-    over DoH against fixed resolver IPs, then connect straight to it with TLS
-    still verified against the real name. Tried only after the normal hostname
-    attempts are exhausted, so a host with working DNS behaves exactly as before
-    and never pays for a DoH lookup.
+    The failover is Telegram, tried only after the normal attempts are
+    exhausted, so a host with working DNS behaves exactly as before and never
+    touches it. An earlier version failed over to ntfy.sh's own IP address found
+    over DoH; that only ever helped a host which could not RESOLVE the name, and
+    the hosts that cost us rigs block the address too. See TG_TOKEN above.
     """
     import requests
     if not topic:
@@ -640,18 +617,7 @@ def ntfy_push(topic, body, title=None, tags=None, tries=4):
             if attempt < tries:
                 time.sleep(delay)
                 delay = min(delay * 2, 15)
-    for ip in _ntfy_addresses():
-        try:
-            _ntfy_post_ip(ip, topic, data, headers)
-            log(f"[ntfy] published to {topic} via {ip} (hostname path is down)")
-            return True
-        except Exception as e:
-            log(f"[ntfy] publish via {ip} failed: {type(e).__name__}: {e}")
-    # Every address failed too. Drop the cache so the next interval re-queries
-    # DoH rather than retrying an address that has stopped serving this host.
-    global _NTFY_IPS
-    _NTFY_IPS = None
-    return False
+    return telegram_push(topic, body)
 
 
 def _eth_call(rpc, data, timeout=10):
@@ -1125,13 +1091,7 @@ class ShareReporter:
     def due(self, now=None):
         return (now or time.time()) - self.last >= self.interval
 
-    def build(self, now=None):
-        now = now or time.time()
-        sample = self.pending
-        if len(sample) > MAX_SHARES_PER_BATCH:
-            # Reservoir sample so the transmitted subset stays unbiased; a
-            # biased sample would skew the controller's hashrate estimate.
-            sample = random.sample(sample, MAX_SHARES_PER_BATCH)
+    def _pack(self, sample, now, truncated):
         prevs, idx = [], {}
         sh = []
         for prev, b, t in sample:
@@ -1146,8 +1106,42 @@ class ShareReporter:
             "gpus": [{"i": g, "n": n, "hr": round(self.rates.get(g, 0.0), 1)}
                      for g, n in sorted(self.gpus.items())],
             "prevs": prevs, "sh": sh,
+            # Says outright that `sh` is a SUBSET of `sc`, whatever the reason.
+            # The aggregator treats a claim of more hits than shares as SUSPECT
+            # unless it can explain the gap, and it used to explain it by
+            # checking len(sh) >= MAX_SHARES_PER_BATCH. That inference breaks the
+            # moment a batch is trimmed for size instead of count -- the rig
+            # would send 31 shares, claim 40 hits, and be flagged for it. So the
+            # rig states the fact rather than leaving it to be re-derived.
+            "tr": 1 if truncated else 0,
             "sc": self.seen_total, "nf": self.found, "err": self.err,
         }
+
+    def build(self, now=None, budget=MAX_MSG_BYTES):
+        now = now or time.time()
+        sample = list(self.pending)
+        truncated = False
+        if len(sample) > MAX_SHARES_PER_BATCH:
+            # Reservoir sample so the transmitted subset stays unbiased; a
+            # biased sample would skew the controller's hashrate estimate.
+            sample = random.sample(sample, MAX_SHARES_PER_BATCH)
+            truncated = True
+        while True:
+            msg = self._pack(sample, now, truncated)
+            if not sample or len(json.dumps(msg)) <= budget:
+                return msg
+            # Over the wire cap. Neither transport truncates an oversized
+            # message, both REJECT it -- ntfy's default message limit and
+            # Telegram's sendMessage limit are both 4096 -- so publishing it
+            # would cost the rig the whole batch and, with nothing arriving,
+            # eventually its life. The cap binds hardest exactly when the batch
+            # spans many prev_hashes, each costing 64 hex chars of `prevs`,
+            # which is also exactly when a rig has been accumulating across a
+            # slow transport. Shed one share and re-measure. Shuffled first so
+            # what survives stays an unbiased subset rather than the oldest.
+            random.shuffle(sample)
+            sample.pop()
+            truncated = True
 
     def flush(self, now=None):
         msg = self.build(now)
