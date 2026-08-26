@@ -75,7 +75,7 @@ TG_MAX_TEXT = 4096         # Telegram's hard cap on sendMessage text
 # seconds on the Telegram path only. 300 sits comfortably inside the
 # controller's stale_grace of 600, so a throttled rig still reads as alive and
 # is never destroyed for it. Solutions are exempt -- see telegram_push.
-TG_MIN_INTERVAL = 300.0
+TG_MIN_INTERVAL = 120.0
 # --- next-gen additions ----------------------------------------------------
 # Share proof: rigs emit hashes clearing a far easier target so the controller
 # can verify they are actually hashing. See hashtoken-next-gen/docs/selection.md
