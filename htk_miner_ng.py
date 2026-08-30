@@ -42,13 +42,26 @@ MASK64 = (1 << 64) - 1
 CONTRACT = "0xE5544a2A5fA9b175da60D8Eec67adD5582bB31b0"
 SEL_PREV_HASH = "0xc69b5df2"
 SEL_MAX_VALUE = "0x98597629"
+# All six verified to serve JSON-RPC BATCH requests and to agree on prev_hash
+# (checked 2026-08-30). The old Cloudflare public gateway was removed: it now
+# errors on every call. llamarpc is kept even though it was returning 521 at the
+# time of the check -- that is a transient outage on their side, not a
+# capability gap, and the hedged reader below simply skips a dead endpoint.
+# Ordered fastest-and-most-reliable first, since that is the one the hedge fires
+# at before fanning out; 1rpc is slow so it sits at the tail.
 READ_RPCS = [
     "https://ethereum-rpc.publicnode.com",
-    "https://eth.llamarpc.com",
-    "https://cloudflare-eth.com",
     "https://eth.drpc.org",
+    "https://rpc.mevblocker.io",
+    "https://eth.meowrpc.com",
+    "https://eth.llamarpc.com",
     "https://1rpc.io/eth",
 ]
+# One batched read is two eth_calls in a single POST. Timeouts are deliberately
+# short: the hedge fans out to the next endpoint after HEDGE_AFTER, so a slow or
+# dead node costs that long, not the full READ_TIMEOUT.
+READ_TIMEOUT = 4.0
+HEDGE_AFTER = 1.5
 
 NTFY_HOST = "ntfy.sh"
 NTFY_BASE = f"https://{NTFY_HOST}"
@@ -72,9 +85,11 @@ TG_MAX_TEXT = 4096         # Telegram's hard cap on sendMessage text
 # Telegram allows roughly 20 messages per minute into one channel, shared by the
 # WHOLE fleet. A 60s heartbeat from even fifteen fallback rigs would exhaust it
 # and start collecting 429s, so heartbeats are throttled to one per this many
-# seconds on the Telegram path only. 300 sits comfortably inside the
-# controller's stale_grace of 600, so a throttled rig still reads as alive and
-# is never destroyed for it. Solutions are exempt -- see telegram_push.
+# seconds on the Telegram path only. At 120 a rig sends one message every two
+# minutes, so the shared channel absorbs roughly forty fallback rigs before the
+# 20/min ceiling bites, and 120 sits five times inside the controller's
+# stale_grace of 600, so a throttled rig still reads as alive and is never
+# destroyed for it. Solutions are exempt -- see telegram_push.
 TG_MIN_INTERVAL = 120.0
 # --- next-gen additions ----------------------------------------------------
 # Share proof: rigs emit hashes clearing a far easier target so the controller
@@ -116,6 +131,28 @@ POLL_INTERVAL = 12.0
 MAX_RESTARTS = 5          # per GPU, before declaring it dead instead of spinning
 FOUND_LOG = SCRIPT_DIR / "found_nonces.jsonl"
 TUNE_CACHE = SCRIPT_DIR / ".tune_cache.json"
+
+
+def _tune_key(name):
+    """Cache key for a device's tuning. Keyed on GPU name, so identical GPUs in
+    a fleet share one entry -- and so the self-test's tune (GPU 0) is reused by
+    the per-GPU workers instead of every one re-running the sweep."""
+    return f"{name}|{TARGET_LAUNCH_SECONDS}"
+
+
+def _write_tune_cache(name, block, grid, hashrate):
+    """Merge one device's result into the on-disk cache. Read-merge-write so a
+    second writer never drops another device's entry. Best-effort: a container
+    with a read-only or missing SCRIPT_DIR just re-tunes next boot."""
+    try:
+        cache = json.loads(TUNE_CACHE.read_text()) if TUNE_CACHE.exists() else {}
+    except Exception:
+        cache = {}
+    cache[_tune_key(name)] = {"block": block, "grid": grid, "hashrate": hashrate}
+    try:
+        TUNE_CACHE.write_text(json.dumps(cache, indent=2))
+    except Exception:
+        pass
 
 
 def log(*a):
@@ -230,9 +267,20 @@ def _autotune(cp, kern, dev, d_prev, d_nonce, d_flag):
     sm = dev.attributes.get("MultiProcessorCount", 16)
     max_grid = int(dev.attributes.get("MaxGridDimX", 2**31 - 1))
     calib = sm * 64
+    # The keccak kernel is register-heavy, so on most GPUs 1024 threads/block
+    # exceeds the per-SM register file and the driver rejects EVERY launch with
+    # "too many resources requested for launch". That ceiling is deterministic
+    # and the compiled kernel reports it, so cap the sweep to it rather than
+    # benchmarking a size that can only fail and log a scary UNUSABLE line each
+    # boot. The try/except below still guards anything the attribute understates.
+    try:
+        kmax = int(kern.attributes["max_threads_per_block"])
+    except Exception:
+        kmax = max(BLOCK_SIZES)
+    blocks = [b for b in BLOCK_SIZES if b <= kmax] or [min(BLOCK_SIZES)]
     best = None
     errs = []
-    for block in BLOCK_SIZES:
+    for block in blocks:
         try:
             _benchmark(cp, kern, d_prev, d_zero, d_nonce, d_flag, block, calib)
             hr = _benchmark(cp, kern, d_prev, d_zero, d_nonce, d_flag, block, calib)
@@ -324,18 +372,15 @@ def gpu_worker(gpu_id, worker_id, num_workers, cu_source, job_buf, job_gen, job_
                 cache = json.loads(TUNE_CACHE.read_text())
             except Exception:
                 cache = {}
-        ck = f"{name}|{TARGET_LAUNCH_SECONDS}"
+        ck = _tune_key(name)
         if ck in cache:
             block, grid, hashrate = cache[ck]["block"], cache[ck]["grid"], cache[ck].get("hashrate", 0.0)
+            log(f"[{tag}] tune cache hit: block={block} grid={grid}")
         else:
             step = "autotune"
             log(f"[{tag}] autotuning (block sizes {BLOCK_SIZES})…")
             block, grid, hashrate = _autotune(cp, kern, dev, d_prev, d_nonce, d_flag)
-            cache[ck] = {"block": block, "grid": grid, "hashrate": hashrate}
-            try:
-                TUNE_CACHE.write_text(json.dumps(cache, indent=2))
-            except Exception:
-                pass
+            _write_tune_cache(name, block, grid, hashrate)
 
         out_q.put({"type": "ready", "gpu": gpu_id, "name": f"{name} (sm_{cc})",
                    "block": block, "grid": grid, "hashrate": hashrate})
@@ -575,7 +620,7 @@ def telegram_push(topic, body):
 def ntfy_push(topic, body, title=None, tags=None, tries=4):
     """Publish one message, falling back to Telegram if ntfy is unreachable.
 
-    read_state_failover has five RPC domains to rotate through; ntfy had one
+    read_state_failover has six RPC domains to rotate through; ntfy had one
     hardcoded hostname and nothing behind it. That asymmetry cost a rig:
     machine 7646 passed its self-test against a live prev_hash, held ~6.3 GH/s
     and accumulated real shares, while every heartbeat logged published=False,
@@ -632,25 +677,92 @@ def _eth_call(rpc, data, timeout=10):
     return bytes.fromhex(result[2:] if result.startswith("0x") else result)
 
 
-def read_state(rpc):
-    prev = _eth_call(rpc, SEL_PREV_HASH)
-    mx = _eth_call(rpc, SEL_MAX_VALUE)
-    if len(prev) != 32 or len(mx) != 32:
-        raise ValueError("bad return length")
-    return prev, int.from_bytes(mx, "big")
+def read_state(rpc, timeout=READ_TIMEOUT):
+    """prev_hash and max_value in ONE batched JSON-RPC POST.
+
+    Two things a batch forces that a single call did not: the spec does NOT
+    guarantee element order, so results are matched by id, not position; and
+    each element carries its OWN error, so an HTTP 200 whose body is a list of
+    error objects (exactly what the dead Cloudflare gateway returned) is a
+    failure, not a success. Either makes this raise, so the caller fails over."""
+    import requests
+    payload = [
+        {"jsonrpc": "2.0", "id": "prev", "method": "eth_call",
+         "params": [{"to": CONTRACT, "data": SEL_PREV_HASH}, "latest"]},
+        {"jsonrpc": "2.0", "id": "maxv", "method": "eth_call",
+         "params": [{"to": CONTRACT, "data": SEL_MAX_VALUE}, "latest"]},
+    ]
+    r = requests.post(rpc, json=payload,
+                      headers={"User-Agent": "htk-miner/1"}, timeout=timeout)
+    r.raise_for_status()
+    body = r.json()
+    if not isinstance(body, list):
+        raise ValueError(f"batch response not a list: {str(body)[:80]}")
+    by = {e.get("id"): e for e in body if isinstance(e, dict)}
+    out = {}
+    for key in ("prev", "maxv"):
+        e = by.get(key)
+        if e is None or e.get("error") or "result" not in e:
+            raise RuntimeError(f"{key}: {(e or {}).get('error', 'missing')}")
+        res = e["result"]
+        b = bytes.fromhex(res[2:] if res.startswith("0x") else res)
+        if len(b) != 32:
+            raise ValueError(f"{key}: bad length {len(b)}")
+        out[key] = b
+    return out["prev"], int.from_bytes(out["maxv"], "big")
 
 
-def read_state_failover(start=0):
-    errs = []
+def read_state_failover(start=0, timeout=READ_TIMEOUT, hedge_after=HEDGE_AFTER):
+    """Hedged read: fire the primary, and if it has not answered within
+    hedge_after, fan out to the next endpoint, then the next, taking the FIRST
+    valid response. A slow or dead node no longer stalls the poll behind its own
+    timeout -- the fastest healthy endpoint wins. Reads are idempotent, so racing
+    several is free; only the winner's value is used.
+
+    Returns (prev, max_value, idx) where idx is the endpoint that answered, so
+    the poller can still log which RPC it is reading from."""
+    import concurrent.futures as cf
     n = len(READ_RPCS)
-    for i in range(n):
-        idx = (start + i) % n
+    order = [(start + i) % n for i in range(n)]
+    errs = []
+    ex = cf.ThreadPoolExecutor(max_workers=n)
+    try:
+        pending = {}          # future -> endpoint index
+        launched = 0
+
+        def launch():
+            nonlocal launched
+            idx = order[launched]
+            pending[ex.submit(read_state, READ_RPCS[idx], timeout)] = idx
+            launched += 1
+
+        launch()
+        while pending or launched < n:
+            if not pending and launched < n:
+                launch()
+            wait_for = hedge_after if launched < n else timeout
+            done, _ = cf.wait(list(pending), timeout=wait_for,
+                              return_when=cf.FIRST_COMPLETED)
+            if done:
+                for f in done:
+                    idx = pending.pop(f)
+                    try:
+                        prev, mx = f.result()
+                        return prev, mx, idx
+                    except Exception as e:
+                        errs.append(f"{READ_RPCS[idx]}: {type(e).__name__}")
+                if launched < n and not pending:
+                    launch()
+            elif launched < n:
+                launch()                     # hedge: nobody answered in time
+            else:
+                break                        # all launched, none good in timeout
+        raise RuntimeError("all read RPCs failed — " + "; ".join(errs))
+    finally:
         try:
-            prev, mx = read_state(READ_RPCS[idx])
-            return prev, mx, idx
-        except Exception as e:
-            errs.append(f"{READ_RPCS[idx]}: {type(e).__name__}")
-    raise RuntimeError("all read RPCs failed — " + "; ".join(errs))
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:                    # Python < 3.9
+            ex.shutdown(wait=False)
 
 
 def chain_poller(job_buf, job_gen, job_lock, out_q, stop_evt):
@@ -1034,7 +1146,12 @@ def self_test(cu_source):
         dev_name = raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name)
         log(f"self-test device: {dev_name} sm_{dev.compute_capability}")
         b, g, hr = _autotune(cp, kern, dev, d_prev, d_nonce, d_flag)
-        log(f"self-test autotune: block={b} grid={g} ~{hr/1e6:.0f} MH/s")
+        # Persist it: the mining run that follows this self-test spawns one
+        # worker per GPU, and without this every one repeats the sweep on a
+        # cold container. Writing it here means identical GPUs read the cache
+        # and skip autotune entirely -- 1 + N tunes per boot becomes 1.
+        _write_tune_cache(dev_name, b, g, hr)
+        log(f"self-test autotune: block={b} grid={g} ~{hr/1e6:.0f} MH/s (cached)")
     except Exception as e:
         tune_ok = False
         log(f"self-test autotune FAILED: {type(e).__name__}: {e}")
